@@ -121,8 +121,12 @@ class NtpClient:
                 "offset_ms": 0.0,
             }
 
-        # Calculate median offset
-        offsets = sorted([r.offset_ms for r in results])
+        # RFC 5905 Clock Filter: discard samples with abnormal RTT (> 1500ms) caused by routing spikes
+        filtered_results = [r for r in results if r.round_trip_ms < 1500.0]
+        candidates = filtered_results if filtered_results else results
+
+        # Calculate median offset among reliable low-RTT candidates
+        offsets = sorted([r.offset_ms for r in candidates])
         median_offset = offsets[len(offsets) // 2]
         self.cached_offset_ms = median_offset
         self.last_sync_time = time.time()
@@ -131,6 +135,7 @@ class NtpClient:
             "success": True,
             "median_offset_ms": round(median_offset, 3),
             "servers_responded": len(results),
+            "reliable_servers": len(candidates),
             "details": [
                 {
                     "server": r.server,

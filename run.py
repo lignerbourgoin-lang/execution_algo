@@ -29,6 +29,7 @@ from core.config import load_task_config
 from core.engine.base import Signal
 from core.network.persistent_client import PrewarmedHttpClient
 from core.rate_limiter.limiter import AdaptiveRateLimiter
+from core.system import boost_process_performance, restore_process_performance
 from core.telemetry.tracker import LatencyTracker
 from modules.retail.checkout.state_machine import (
     CheckoutProfile,
@@ -40,6 +41,10 @@ console = Console()
 
 
 async def execute_task(config: dict):
+    # Elevate OS priority and 1ms timer precision
+    boosted = boost_process_performance()
+    if boosted:
+        console.print("[dim][System] Priorité CPU élevée & interruption 1ms activées.[/dim]")
     task_name = config.get("task_name", "Execution Task")
     target = config["target"]
     scheduling = config.get("scheduling", {})

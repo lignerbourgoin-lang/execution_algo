@@ -91,10 +91,12 @@ class PrewarmedHttpClient:
         endpoint: str,
         action_id: str,
         json_data: Optional[Dict[str, Any]] = None,
+        content: Optional[bytes] = None,
         headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Executes a priority action on the pre-warmed connection with microsecond tracking.
+        Supports both json_data and pre-serialized raw bytes.
         """
         trace = self.telemetry.start_trace(action_id=action_id, target=f"{self.base_url}{endpoint}")
 
@@ -105,11 +107,21 @@ class PrewarmedHttpClient:
         # 2. Dispatch request over warm socket
         t_dispatch = time.perf_counter_ns()
         try:
+            req_kwargs = {}
+            req_headers = dict(headers) if headers else {}
+
+            if content is not None:
+                req_kwargs["content"] = content
+                if "Content-Type" not in req_headers and "content-type" not in req_headers:
+                    req_headers["Content-Type"] = "application/json"
+            elif json_data is not None:
+                req_kwargs["json"] = json_data
+
             res = await self.client.request(
                 method=method,
                 url=endpoint,
-                json=json_data,
-                headers=headers,
+                headers=req_headers if req_headers else None,
+                **req_kwargs,
             )
             t_recv = time.perf_counter_ns()
             trace.mark_stage("response_received")
