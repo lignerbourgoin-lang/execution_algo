@@ -142,6 +142,11 @@ class MiniGuiApp:
         self.root.minsize(440, 500)
         self.root.configure(bg="#121212")
 
+        # Bring window immediately to the front of user desktop
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+        self.root.after(200, lambda: self.root.attributes("-topmost", False))
+
         self.ui_queue = queue.Queue()
         self.worker = EngineWorker(self.ui_queue)
 
