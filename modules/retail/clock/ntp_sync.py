@@ -1,0 +1,204 @@
+"""
+NTP Time Synchronization & Sub-Millisecond Scheduler
+----------------------------------------------------
+Provides:
+1. NtpClient: High-precision RFC 5905 SNTP client measuring local clock drift/offset.
+2. HighPrecisionScheduler: Hybrid (async sleep + spin-wait) scheduler for T0 target execution.
+"""
+
+import asyncio
+import socket
+import struct
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Coroutine, Dict, List, Optional
+
+# NTP epoch starts at Jan 1 1900, Unix epoch starts at Jan 1 1970
+# Difference in seconds between 1900 and 1970 (including leap years)
+NTP_DELTA = 2208988800
+
+
+@dataclass
+class NtpSyncResult:
+    server: str
+    offset_ms: float       # Difference: (Atomic Time - Local Time) in ms
+    round_trip_ms: float   # Network RTT to NTP server
+    stratum: int
+    precision: float
+    synced_at_local: float # Local time.time() when sync completed
+
+
+class NtpClient:
+    """
+    Standard Network Time Protocol (RFC 5905) client.
+    Calculates clock skew between local machine and atomic time sources.
+    """
+
+    DEFAULT_SERVERS = [
+        "time.cloudflare.com",
+        "time.google.com",
+        "pool.ntp.org",
+    ]
+
+    def __init__(self, timeout: float = 2.0):
+        self.timeout = timeout
+        self.cached_offset_ms: float = 0.0
+        self.last_sync_time: float = 0.0
+
+    def query_server(self, host: str, port: int = 123) -> Optional[NtpSyncResult]:
+        """
+        Sends an SNTP query to the given server and calculates offset and delay.
+        """
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.settimeout(self.timeout)
+
+        # RFC 5905: LI = 0, VN = 4 (NTPv4), Mode = 3 (Client) -> 0x23
+        msg = b"\x23" + 47 * b"\0"
+
+        try:
+            # T1: Client transmit time
+            t1 = time.time()
+            t1_perf = time.perf_counter_ns()
+            client.sendto(msg, (host, port))
+
+            data, _ = client.recvfrom(1024)
+            # T4: Client receive time
+            t4_perf = time.perf_counter_ns()
+            t4 = time.time()
+
+            if len(data) < 48:
+                return None
+
+            unpacked = struct.unpack("!BBBb11I", data[:48])
+            stratum = unpacked[1]
+            precision = unpacked[3]
+
+            # T2: Server receive time (offset 32..40 -> indices 11, 12)
+            t2_sec = unpacked[11] - NTP_DELTA
+            t2_frac = unpacked[12] / float(2**32)
+            t2 = t2_sec + t2_frac
+
+            # T3: Server transmit time (offset 40..48 -> indices 13, 14)
+            t3_sec = unpacked[13] - NTP_DELTA
+            t3_frac = unpacked[14] / float(2**32)
+            t3 = t3_sec + t3_frac
+
+            # Calculate network round-trip and clock offset
+            rtt_sec = (t4 - t1) - (t3 - t2)
+            offset_sec = ((t2 - t1) + (t3 - t4)) / 2.0
+
+            return NtpSyncResult(
+                server=host,
+                offset_ms=offset_sec * 1000.0,
+                round_trip_ms=max(0.0, rtt_sec * 1000.0),
+                stratum=stratum,
+                precision=float(precision),
+                synced_at_local=t4,
+            )
+
+        except Exception:
+            return None
+        finally:
+            client.close()
+
+    def sync(self, servers: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Queries all servers, filters valid responses, and calculates median clock offset.
+        """
+        servers = servers or self.DEFAULT_SERVERS
+        results: List[NtpSyncResult] = []
+
+        for s in servers:
+            res = self.query_server(s)
+            if res:
+                results.append(res)
+
+        if not results:
+            return {
+                "success": False,
+                "error": "All NTP queries failed",
+                "offset_ms": 0.0,
+            }
+
+        # Calculate median offset
+        offsets = sorted([r.offset_ms for r in results])
+        median_offset = offsets[len(offsets) // 2]
+        self.cached_offset_ms = median_offset
+        self.last_sync_time = time.time()
+
+        return {
+            "success": True,
+            "median_offset_ms": round(median_offset, 3),
+            "servers_responded": len(results),
+            "details": [
+                {
+                    "server": r.server,
+                    "offset_ms": round(r.offset_ms, 3),
+                    "rtt_ms": round(r.round_trip_ms, 3),
+                    "stratum": r.stratum,
+                }
+                for r in results
+            ],
+        }
+
+    def get_atomic_time(self) -> float:
+        """Returns the current true UTC time (in seconds) adjusted for clock offset."""
+        return time.time() + (self.cached_offset_ms / 1000.0)
+
+
+class HighPrecisionScheduler:
+    """
+    Schedules execution at exact atomic UTC timestamps.
+    Uses hybrid coarse sleep (asyncio.sleep) + fine spin-waiting (perf_counter_ns)
+    to achieve sub-millisecond dispatch accuracy.
+    """
+
+    def __init__(self, ntp_client: Optional[NtpClient] = None):
+        self.ntp = ntp_client or NtpClient()
+
+    async def wait_until_atomic_timestamp(
+        self,
+        target_atomic_timestamp_utc: float,
+        latency_advance_ms: float = 0.0,
+    ) -> Dict[str, float]:
+        """
+        Waits until the exact target timestamp.
+        :param target_atomic_timestamp_utc: True UTC timestamp when target event occurs.
+        :param latency_advance_ms: Network lead time (e.g. RTT / 2) to fire before T0.
+        :return: Metrics describing dispatch accuracy.
+        """
+        # Ensure NTP sync is performed
+        if self.ntp.last_sync_time == 0.0:
+            self.ntp.sync()
+
+        offset_sec = self.ntp.cached_offset_ms / 1000.0
+        advance_sec = latency_advance_ms / 1000.0
+
+        # Target time on local system clock
+        target_local_time = target_atomic_timestamp_utc - offset_sec - advance_sec
+
+        # 1. Coarse sleep phase (releases CPU loop until ~10ms before target)
+        now_local = time.time()
+        remaining_sec = target_local_time - now_local
+
+        if remaining_sec > 0.015:
+            await asyncio.sleep(remaining_sec - 0.010)
+
+        # 2. Fine spin-wait phase (uses high-resolution nanosecond clock)
+        # Convert target local time to perf_counter reference
+        t_ref_time = time.time()
+        t_ref_perf = time.perf_counter_ns()
+        perf_target_ns = t_ref_perf + int((target_local_time - t_ref_time) * 1_000_000_000)
+
+        # Busy-wait until exact target nanosecond is reached
+        while time.perf_counter_ns() < perf_target_ns:
+            pass
+
+        fired_at_perf = time.perf_counter_ns()
+        accuracy_us = (fired_at_perf - perf_target_ns) / 1000.0  # Jitter in microseconds
+
+        return {
+            "accuracy_us": round(accuracy_us, 2),
+            "offset_applied_ms": round(self.ntp.cached_offset_ms, 3),
+            "lead_time_applied_ms": round(latency_advance_ms, 3),
+        }
