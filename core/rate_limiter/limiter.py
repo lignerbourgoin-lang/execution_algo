@@ -45,7 +45,9 @@ class TokenBucketLimiter:
 
     async def acquire(self, tokens: float = 1.0) -> float:
         """
-        Asynchronous acquisition. Waits non-blockingly until tokens are available.
+        Asynchronous acquisition.
+        Calculates required wait time inside the lock, then sleeps outside
+        the lock to prevent serializing other concurrent tasks.
         Returns the duration waited in milliseconds.
         """
         async with self._lock:
@@ -57,11 +59,15 @@ class TokenBucketLimiter:
             # Calculate exact time to wait until enough tokens are replenished
             needed = tokens - self.tokens
             wait_seconds = needed / self.rate
+            # Reserve slot by pushing virtual baseline forward
+            self.tokens = 0.0
+            self.last_update_ns = max(self.last_update_ns, time.perf_counter_ns()) + int(wait_seconds * 1_000_000_000)
+
+        # Sleep outside the lock so other coroutines can acquire slots concurrently
+        if wait_seconds > 0:
             await asyncio.sleep(wait_seconds)
 
-            self._refill()
-            self.tokens = max(0.0, self.tokens - tokens)
-            return wait_seconds * 1000.0
+        return wait_seconds * 1000.0
 
 
 class AdaptiveRateLimiter:

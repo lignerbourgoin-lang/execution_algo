@@ -130,19 +130,21 @@ class FastCheckoutStateMachine(BaseExecutor):
         )
         trace.mark_stage("shipping_submitted_ack")
 
-        self.state = CheckoutState.COMPLETED
-        trace.complete(success=True)
+        is_success = (shipping_res.get("status_code") in (200, 201))
+        self.state = CheckoutState.COMPLETED if is_success else CheckoutState.FAILED
+        trace.complete(success=is_success, error=None if is_success else f"HTTP {shipping_res.get('status_code')}")
 
         return ExecutionResult(
             action_id=trace.action_id,
-            success=True,
-            status_code=shipping_res.get("status_code", 200),
+            success=is_success,
+            status_code=shipping_res.get("status_code", 0),
             data={
                 "reservation": reserve_res.get("body"),
                 "shipping": shipping_res.get("body"),
                 "stages": trace.get_breakdown(),
             },
             latency_ms=trace.total_latency_ms,
+            error=None if is_success else f"Shipping step returned HTTP {shipping_res.get('status_code')}",
         )
 
     async def shutdown(self):

@@ -9,6 +9,7 @@ Provides:
 import asyncio
 import socket
 import struct
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Coroutine, Dict, List, Optional
@@ -171,34 +172,52 @@ class HighPrecisionScheduler:
         if self.ntp.last_sync_time == 0.0:
             self.ntp.sync()
 
-        offset_sec = self.ntp.cached_offset_ms / 1000.0
-        advance_sec = latency_advance_ms / 1000.0
+        # Boost Windows timer resolution from 15.6ms to 1ms
+        is_win = (sys.platform == "win32")
+        if is_win:
+            try:
+                import ctypes
+                ctypes.windll.winmm.timeBeginPeriod(1)
+            except Exception:
+                pass
 
-        # Target time on local system clock
-        target_local_time = target_atomic_timestamp_utc - offset_sec - advance_sec
+        try:
+            offset_ns = int(self.ntp.cached_offset_ms * 1_000_000)
+            advance_ns = int(latency_advance_ms * 1_000_000)
+            target_atomic_ns = int(target_atomic_timestamp_utc * 1_000_000_000)
 
-        # 1. Coarse sleep phase (releases CPU loop until ~10ms before target)
-        now_local = time.time()
-        remaining_sec = target_local_time - now_local
+            # Target timestamp on local system clock
+            target_local_ns = target_atomic_ns - offset_ns - advance_ns
 
-        if remaining_sec > 0.015:
-            await asyncio.sleep(remaining_sec - 0.010)
+            # 1. Coarse sleep phase (releases CPU loop until ~5ms before target)
+            now_local_ns = time.time_ns()
+            remaining_ns = target_local_ns - now_local_ns
 
-        # 2. Fine spin-wait phase (uses high-resolution nanosecond clock)
-        # Convert target local time to perf_counter reference
-        t_ref_time = time.time()
-        t_ref_perf = time.perf_counter_ns()
-        perf_target_ns = t_ref_perf + int((target_local_time - t_ref_time) * 1_000_000_000)
+            if remaining_ns > 12_000_000:  # > 12 ms
+                sleep_sec = (remaining_ns - 6_000_000) / 1_000_000_000.0
+                await asyncio.sleep(sleep_sec)
 
-        # Busy-wait until exact target nanosecond is reached
-        while time.perf_counter_ns() < perf_target_ns:
-            pass
+            # 2. Fine spin-wait phase using high-resolution perf_counter
+            t_ref_time_ns = time.time_ns()
+            t_ref_perf_ns = time.perf_counter_ns()
+            perf_target_ns = t_ref_perf_ns + (target_local_ns - t_ref_time_ns)
 
-        fired_at_perf = time.perf_counter_ns()
-        accuracy_us = (fired_at_perf - perf_target_ns) / 1000.0  # Jitter in microseconds
+            # Busy-wait until exact target nanosecond is reached
+            while time.perf_counter_ns() < perf_target_ns:
+                pass
 
-        return {
-            "accuracy_us": round(accuracy_us, 2),
-            "offset_applied_ms": round(self.ntp.cached_offset_ms, 3),
-            "lead_time_applied_ms": round(latency_advance_ms, 3),
-        }
+            fired_at_perf = time.perf_counter_ns()
+            accuracy_us = (fired_at_perf - perf_target_ns) / 1000.0  # Jitter in microseconds
+
+            return {
+                "accuracy_us": round(accuracy_us, 2),
+                "offset_applied_ms": round(self.ntp.cached_offset_ms, 3),
+                "lead_time_applied_ms": round(latency_advance_ms, 3),
+            }
+        finally:
+            if is_win:
+                try:
+                    import ctypes
+                    ctypes.windll.winmm.timeEndPeriod(1)
+                except Exception:
+                    pass

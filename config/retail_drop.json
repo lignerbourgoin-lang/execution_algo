@@ -1,0 +1,32 @@
+{
+  "task_name": "Lancement Drop / Billet Exemple",
+  "target": {
+    "base_url": "https://api.binance.com",
+    "reserve_endpoint": "/api/v3/time",
+    "reserve_method": "GET",
+    "shipping_endpoint": "/api/v3/time",
+    "shipping_method": "GET",
+    "item_id": "TICKET-CONCERT-CAT1",
+    "quantity": 1
+  },
+  "scheduling": {
+    "mode": "immediate",
+    "target_time_utc": null,
+    "lead_time_ms": 10.0
+  },
+  "rate_limiting": {
+    "requests_per_second": 5.0,
+    "burst_capacity": 10.0
+  },
+  "customer_profile": {
+    "email": "utilisateur@domaine.com",
+    "shipping_address": {
+      "first_name": "Eliott",
+      "last_name": "Dupont",
+      "address1": "10 Rue de la Paix",
+      "city": "Paris",
+      "zip": "75001",
+      "country": "FR"
+    }
+  }
+}
