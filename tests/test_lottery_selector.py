@@ -87,6 +87,52 @@ class TestLotteryQueueSelector(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.selector.register_ticket("10.0.0.1", 0)  # queue rank must be >= 1
 
+    def test_all_under_threshold(self):
+        self.selector.register_ticket("10.0.0.1", 12)
+        self.selector.register_ticket("10.0.0.2", 45)
+        self.selector.register_ticket("10.0.0.3", 99)
+        self.assertTrue(self.selector.all_under_threshold(100))
+
+        # Adding an IP > 100 makes it False
+        self.selector.register_ticket("10.0.0.4", 101)
+        self.assertFalse(self.selector.all_under_threshold(100))
+
+    def test_select_adaptive_all_golden(self):
+        # When all 5 IPs are under 100, all 5 are kept
+        for i, rank in enumerate([10, 25, 42, 60, 85], start=1):
+            self.selector.register_ticket(f"192.168.1.{i}", rank)
+
+        kept, discarded = self.selector.select_adaptive(golden_threshold=100)
+        self.assertEqual(len(kept), 5)
+        self.assertEqual(len(discarded), 0)
+
+    def test_select_adaptive_partial_golden(self):
+        # 2 IPs <= 100, 3 IPs > 100 -> Keep only the 2 golden ones
+        self.selector.register_ticket("10.0.0.1", 15)
+        self.selector.register_ticket("10.0.0.2", 82)
+        self.selector.register_ticket("10.0.0.3", 450)
+        self.selector.register_ticket("10.0.0.4", 12000)
+        self.selector.register_ticket("10.0.0.5", 85000)
+
+        kept, discarded = self.selector.select_adaptive(golden_threshold=100)
+        self.assertEqual(len(kept), 2)
+        self.assertEqual([t.queue_number for t in kept], [15, 82])
+        self.assertEqual(len(discarded), 3)
+
+    def test_select_adaptive_fallback_retention(self):
+        # Realistic scenario: 0 IPs <= 100, all are high ranks
+        self.selector.register_ticket("10.0.0.1", 1450)
+        self.selector.register_ticket("10.0.0.2", 3200)
+        self.selector.register_ticket("10.0.0.3", 15000)
+        self.selector.register_ticket("10.0.0.4", 45000)
+        self.selector.register_ticket("10.0.0.5", 98000)
+
+        # Fallback keeps min_keep=2 best tickets (1450 and 3200)
+        kept, discarded = self.selector.select_adaptive(golden_threshold=100, min_keep=2)
+        self.assertEqual(len(kept), 2)
+        self.assertEqual([t.queue_number for t in kept], [1450, 3200])
+        self.assertEqual(len(discarded), 3)
+
 
 class TestMultiIpLotteryOrchestrator(unittest.IsolatedAsyncioTestCase):
     async def test_survey_pool_selects_best_ips(self):

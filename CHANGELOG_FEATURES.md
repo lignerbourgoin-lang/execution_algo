@@ -24,3 +24,12 @@
 - Orchestration asynchrone concurrente (`MultiIpLotteryOrchestrator`) avec sémaphore de concurrence et timeout par IP.
 **Attention**:
 - Un numéro de file bas ne garantit l'achat que si le token/cookie de session associé à cette IP est conservé pour la phase de checkout.
+
+## [2026-10-01] ADAPTIVE_LOTTERY_THRESHOLD
+**Fichiers**: `modules/retail/tickets/lottery_selector.py`, `tests/test_lottery_selector.py`
+**Raison**: Permettre la rétention dynamique de tous les tickets d'exception (ex: <= 100) tout en intégrant un repli de secours (`min_keep`) si aucune IP n'obtient un rang d'exception.
+**Logique**:
+- Ajout de `all_under_threshold(threshold)` pour tester si 100% des IP ont obtenu un rang exceptionnel.
+- Ajout de `select_adaptive(golden_threshold, min_keep, max_keep)` : conserve toutes les IP ayant un rang <= seuil (garde les 5 si les 5 sont <= 100), mais conserve au minimum le top `min_keep` si aucun ticket n'atteint le seuil, évitant l'abandon total des sessions en cas de forte affluence.
+**Attention**:
+- Sur un drop à fort trafic (50 000 personnes), la probabilité que 5 IP sur 5 soient dans le top 100 est infinitésimale (~3.2e-14). Le mécanisme de repli est indispensable.

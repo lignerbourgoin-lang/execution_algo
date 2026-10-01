@@ -186,6 +186,91 @@ class LotteryQueueSelector:
 
         return kept, discarded
 
+    # [FEATURE: ADAPTIVE_LOTTERY_THRESHOLD] Golden threshold qualification and fallback retention
+    # Raison: Preserves all sessions with exceptional queue numbers (e.g. <= 100) while guaranteeing minimum viable fallback
+    # Attention: In massive drops, the statistical chance of all IPs being <= 100 is near zero; fallback retention prevents zero-selection lockout
+    def all_under_threshold(self, threshold: int = 100) -> bool:
+        """
+        Returns True if all registered tickets have a queue number within the threshold.
+        """
+        with self._lock:
+            if not self._tickets:
+                return False
+            if self.lower_is_better:
+                return all(t.queue_number <= threshold for t in self._tickets.values())
+            return all(t.queue_number >= threshold for t in self._tickets.values())
+
+    def select_adaptive(
+        self,
+        golden_threshold: int = 100,
+        min_keep: int = 1,
+        max_keep: Optional[int] = None,
+    ) -> Tuple[List[LotteryTicket], List[LotteryTicket]]:
+        """
+        Adaptive selection policy:
+        1. If tickets meet the golden threshold (e.g. <= 100), keep all of them (up to max_keep).
+        2. If all IPs are <= 100, all are preserved.
+        3. If fewer than min_keep tickets meet the threshold, retain the top min_keep tickets
+           as fallback to prevent losing all connections.
+
+        Args:
+            golden_threshold: Exceptional queue rank threshold (default: 100).
+            min_keep: Minimum number of tickets to preserve even if none meet golden threshold.
+            max_keep: Maximum tickets to preserve. None means no ceiling.
+
+        Returns:
+            Tuple of (kept_tickets, discarded_tickets).
+        """
+        with self._lock:
+            all_tickets = list(self._tickets.values())
+
+            # Sort best first
+            all_tickets.sort(
+                key=lambda t: t.queue_number,
+                reverse=not self.lower_is_better,
+            )
+
+            qualifying: List[LotteryTicket] = []
+            non_qualifying: List[LotteryTicket] = []
+
+            for ticket in all_tickets:
+                is_golden = (
+                    ticket.queue_number <= golden_threshold
+                    if self.lower_is_better
+                    else ticket.queue_number >= golden_threshold
+                )
+                if is_golden:
+                    qualifying.append(ticket)
+                else:
+                    non_qualifying.append(ticket)
+
+            # Determine tickets to keep
+            # Start with qualifying golden tickets
+            kept = list(qualifying)
+
+            # If fewer than min_keep, pad from best non-qualifying
+            if len(kept) < min_keep:
+                needed = min_keep - len(kept)
+                kept.extend(non_qualifying[:needed])
+                non_qualifying = non_qualifying[needed:]
+
+            # Apply max_keep ceiling if specified
+            if max_keep is not None and len(kept) > max_keep:
+                overflow = kept[max_keep:]
+                kept = kept[:max_keep]
+                non_qualifying = overflow + non_qualifying
+
+            # Re-sort non_qualifying into discarded
+            discarded = non_qualifying
+
+            # Update statuses
+            for ticket in kept:
+                ticket.status = "selected"
+            for ticket in discarded:
+                ticket.status = "discarded"
+
+        return kept, discarded
+
     def clear(self) -> None:
         """Clears all registered tickets."""
         with self._lock:
