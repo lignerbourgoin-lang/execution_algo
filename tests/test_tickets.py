@@ -179,6 +179,113 @@ class TestTicketDropEngine(unittest.IsolatedAsyncioTestCase):
         # Ensure 2 attempts were made
         self.assertEqual(len(mock_client.calls), 2)
 
+    async def test_micro_burst_retry_on_unopened_gate(self):
+        # Server hasn't opened gates yet at T0: returns 404, then 425, then 200 on attempt 3
+        attempts = 0
+
+        class UnopenedGateMockClient(MockTicketingHttpClient):
+            async def send_fast(self, request, action_id):
+                nonlocal attempts
+                attempts += 1
+                self.calls.append({"endpoint": str(request.url), "action_id": action_id})
+                if attempts == 1:
+                    return {"status_code": 404, "error": "Sale not started yet"}
+                elif attempts == 2:
+                    return {"status_code": 425, "error": "Too Early"}
+                else:
+                    return {
+                        "status_code": 200,
+                        "body": {"token": "tok_burst_success", "hold_time_sec": 600},
+                    }
+
+        mock_client = UnopenedGateMockClient()
+        mock_ntp = MockNtpClient()
+        config = TicketConfig(
+            platform_name="billetterie_test",
+            target_url="https://billetterie.example.com",
+            event_id="STADE-2026",
+            category_id="CARRE_OR",
+            quantity=1,
+            burst_retries=4,
+            burst_interval_ms=10.0,
+            auto_open_browser=False,
+            audible_alert=False,
+        )
+
+        executor = TicketDropExecutor(config=config, http_client=mock_client, ntp_client=mock_ntp)
+        await executor.initialize()
+
+        result = await executor.execute_drop()
+        self.assertTrue(result.success)
+        self.assertEqual(executor.active_cart.token, "tok_burst_success")
+        self.assertEqual(attempts, 3)
+
+    async def test_parallel_category_hedging(self):
+        # Concurrently reserves across multiple categories; first successful reservation wins
+        class HedgedMockClient(MockTicketingHttpClient):
+            async def send_fast(self, request, action_id):
+                if "CARRE_OR" in action_id:
+                    await asyncio.sleep(0.05)
+                    return {"status_code": 409, "error": "Sold out"}
+                else:
+                    return {"status_code": 200, "body": {"token": "tok_hedged_cat1"}}
+
+        mock_client = HedgedMockClient()
+        mock_ntp = MockNtpClient()
+        config = TicketConfig(
+            platform_name="billetterie_test",
+            target_url="https://billetterie.example.com",
+            event_id="PARALLEL-2026",
+            category_id="CARRE_OR",
+            fallback_categories=["CAT_1"],
+            quantity=1,
+            auto_open_browser=False,
+            audible_alert=False,
+        )
+
+        executor = TicketDropExecutor(config=config, http_client=mock_client, ntp_client=mock_ntp)
+        await executor.initialize()
+
+        res = await executor.execute_parallel_categories()
+        self.assertTrue(res.success)
+        self.assertEqual(executor.active_cart.token, "tok_hedged_cat1")
+
+    async def test_multi_category_wave_release_sniping(self):
+        # Primary category has 0 seats, but Fallback category has 2 seats available
+        class MultiCatReleaseClient(MockTicketingHttpClient):
+            async def execute_fast(self, method, endpoint, action_id, json_data=None, headers=None, idempotency_key=None):
+                if "cat=CARRE_OR" in endpoint:
+                    return {"status_code": 200, "body": {"available": 0}}
+                elif "cat=CAT_1" in endpoint:
+                    return {"status_code": 200, "body": {"available": 2}}
+                return {"status_code": 200, "body": {"available": 0}}
+
+            async def send_fast(self, request, action_id):
+                return {"status_code": 200, "body": {"token": "tok_release_cat1"}}
+
+        mock_client = MultiCatReleaseClient()
+        mock_ntp = MockNtpClient()
+        config = TicketConfig(
+            platform_name="billetterie_test",
+            target_url="https://billetterie.example.com",
+            event_id="WAVE-2026",
+            category_id="CARRE_OR",
+            fallback_categories=["CAT_1"],
+            quantity=2,
+            auto_open_browser=False,
+            audible_alert=False,
+        )
+
+        executor = TicketDropExecutor(config=config, http_client=mock_client, ntp_client=mock_ntp)
+        await executor.initialize()
+
+        res = await executor.monitor_cart_releases(poll_interval_sec=0.01, max_duration_sec=0.5, jitter_ms=0.0)
+        self.assertIsNotNone(res)
+        self.assertTrue(res.success)
+        self.assertEqual(executor.active_cart.token, "tok_release_cat1")
+        self.assertEqual(executor.active_cart.category_id, "CAT_1")
+
 
 if __name__ == "__main__":
     unittest.main()
+

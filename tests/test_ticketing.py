@@ -176,6 +176,28 @@ class TestResaleWatcher(unittest.IsolatedAsyncioTestCase):
         await watcher.handle_document(make_feed(make_listing(1, 90), make_listing(2, 50)), time.perf_counter_ns())
         self.assertEqual([n.url for n in recorder.sent], ["https://r.example/2"])
 
+    async def test_auto_reserve_action_triggers_and_updates_alert(self):
+        recorder = RecordingNotifier()
+        config = ResaleWatchConfig(
+            url="https://r.example/feed",
+            items_path="data.listings",
+            fields=FEED_FIELDS,
+            filters=ListingFilters(max_price=Decimal("100")),
+        )
+        reserved_items = []
+
+        async def mock_auto_reserve(listing):
+            reserved_items.append(listing.listing_id)
+            return {"checkout_url": f"https://r.example/checkout/{listing.listing_id}"}
+
+        watcher = ResaleWatcher(config, [recorder], auto_reserve_action=mock_auto_reserve)
+        await watcher.handle_document(make_feed(make_listing(42, 85)), time.perf_counter_ns())
+
+        self.assertEqual(reserved_items, ["42"])
+        self.assertEqual(len(recorder.sent), 1)
+        self.assertIn("PANIER VERROUILLÉ", recorder.sent[0].title)
+        self.assertEqual(recorder.sent[0].url, "https://r.example/checkout/42")
+
     def test_requires_a_notifier(self):
         with self.assertRaises(ValueError):
             ResaleWatcher(ResaleWatchConfig(url="https://r.example/feed"), [])

@@ -87,18 +87,27 @@ class TicketWorker:
         )
 
         cookies = {"session_id": session_cookie} if session_cookie else None
+        categories = [c.strip() for c in category_id.split(",") if c.strip()]
+        primary_cat = categories[0] if categories else "DEFAULT"
+        fallback_cats = categories[1:] if len(categories) > 1 else []
+
+        if fallback_cats:
+            self.ui_queue.put(("log", f"[CONFIG] Catégorie principale: {primary_cat} | Secours: {', '.join(fallback_cats)}"))
 
         config = TicketConfig(
             platform_name="billetterie",
             target_url=target_url,
             event_id=event_id,
-            category_id=category_id,
+            category_id=primary_cat,
+            fallback_categories=fallback_cats,
             quantity=quantity,
             drop_time_utc=drop_time_utc,
             lead_time_ms=lead_time_ms,
             auth_token=auth_token if auth_token else None,
             session_cookies=cookies,
             auto_open_browser=True,
+            burst_retries=5,
+            burst_interval_ms=80.0,
         )
 
         self.executor = TicketDropExecutor(
@@ -111,7 +120,7 @@ class TicketWorker:
         await self.executor.initialize()
         self.is_armed = True
         self.ui_queue.put(("status", ("ARMÉ & PRÊT", "#00E676")))
-        self.ui_queue.put(("log", "[OK] Socket TLS connectée & session prête pour l'injection."))
+        self.ui_queue.put(("log", f"[OK] Socket TLS connectée. Prêt pour tir T0 (Rafale 5x) ou rattrapage."))
 
     async def trigger_drop(self):
         if not self.is_armed or not self.executor:
@@ -161,9 +170,17 @@ class TicketWorker:
             return
 
         self.ui_queue.put(("status", ("SURVEILLANCE PANIERS", "#29B6F6")))
-        self.ui_queue.put(("log", ">> Début de surveillance des paniers expirés (intervalle 500ms)..."))
+        watched_str = f"{self.executor.config.category_id}"
+        if self.executor.config.fallback_categories:
+            watched_str += f" + {', '.join(self.executor.config.fallback_categories)}"
+        self.ui_queue.put(("log", f">> Surveillance paniers expirés active sur [{watched_str}] (vagues adaptatives 150ms)..."))
 
-        result = await self.executor.monitor_cart_releases(poll_interval_sec=0.5, max_duration_sec=600.0)
+        result = await self.executor.monitor_cart_releases(
+            poll_interval_sec=0.5,
+            max_duration_sec=900.0,
+            wave_poll_interval_sec=0.15,
+            jitter_ms=25.0,
+        )
         if result and result.success:
             cart = result.data.get("cart", {})
             self.checkout_url = cart.get("checkout_url", "")
@@ -266,9 +283,9 @@ class BilletterieSniperApp:
 
         frame_cat = tk.Frame(row_event, bg="#1E1E1E")
         frame_cat.pack(side="left", fill="x", expand=True, padx=(5, 0))
-        tk.Label(frame_cat, text="Catégorie (Fosse / Cat 1...) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#1E1E1E").pack(anchor="w")
+        tk.Label(frame_cat, text="Catégories (ex: CARRE_OR, CAT_1) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#1E1E1E").pack(anchor="w")
         self.entry_cat = tk.Entry(frame_cat, font=("Segoe UI", 9), bg="#2A2A2A", fg="#FFFFFF", insertbackground="white")
-        self.entry_cat.insert(0, "CARRE_OR")
+        self.entry_cat.insert(0, "CARRE_OR, CAT_1")
         self.entry_cat.pack(fill="x", pady=2)
 
         # Quantité & Lead Time (ms)

@@ -13,6 +13,7 @@ Specialized execution engine dedicated to ticketing and event drops:
 import asyncio
 from dataclasses import dataclass, field
 import logging
+import random
 import time
 from typing import Any, Dict, List, Optional
 import uuid
@@ -44,6 +45,8 @@ class TicketConfig:
     session_cookies: Optional[Dict[str, str]] = None
     auto_open_browser: bool = True
     audible_alert: bool = True
+    burst_retries: int = 5                 # Rapid micro-burst attempts at T0 if server hasn't opened gates yet
+    burst_interval_ms: float = 80.0       # Delay between micro-burst attempts (ms)
 
 
 @dataclass
@@ -162,13 +165,97 @@ class TicketDropExecutor(BaseExecutor):
 
     async def _execute_with_fallbacks(self) -> ExecutionResult:
         """
-        Executes the primary category reservation.
-        If sold out (400, 404, 409, 422), immediately tries fallback categories on the same socket.
+        Executes the primary category reservation with rapid micro-burst retries.
+        If the server indicates gates are not open yet (404, 425, 503, or 400 not started),
+        fires rapid micro-burst retries on the pre-warmed socket up to burst_retries times.
+        If sold out (409, 400/422 sold out), immediately cascades to fallback categories.
         """
         categories = [self.config.category_id] + self.config.fallback_categories
         last_result: Optional[ExecutionResult] = None
 
-        for cat in categories:
+        for cat_idx, cat in enumerate(categories):
+            is_primary = (cat_idx == 0)
+            max_attempts = (1 + self.config.burst_retries) if is_primary else 1
+
+            for attempt in range(max_attempts):
+                signal = Signal(
+                    source="ticket_engine",
+                    target_id=self.config.event_id,
+                    action="RESERVE_TICKETS",
+                    payload={
+                        "event_id": self.config.event_id,
+                        "category_id": cat,
+                        "quantity": self.config.quantity,
+                        "auth_token": self.config.auth_token,
+                        "idempotency_key": f"ticket_{self.config.event_id}_{cat}_{uuid.uuid4().hex[:8]}",
+                    },
+                    urgency=3,
+                )
+
+                res = await self.execute(signal)
+                if res.success:
+                    return res
+
+                last_result = res
+                status = res.status_code
+                err_text = (str(res.error or "") + " " + str(res.data or "")).lower()
+
+                # Case 1: Server not opened yet / drop lag
+                # (404 Not Found, 425 Too Early, 503 Service Unavailable, or 400 with 'not open' / 'soon' / 'closed' / 'attente')
+                is_unopened = (
+                    status in (404, 425, 503) or
+                    (status == 400 and any(kw in err_text for kw in ["not open", "not started", "soon", "attente", "ferme", "early"]))
+                )
+
+                if is_unopened and attempt < max_attempts - 1:
+                    logger.info(
+                        f"Drop gate not open yet (HTTP {status}) for '{cat}', micro-burst retry #{attempt + 1}/{self.config.burst_retries} in {self.config.burst_interval_ms}ms..."
+                    )
+                    await asyncio.sleep(self.config.burst_interval_ms / 1000.0)
+                    continue
+
+                # Case 2: Category is sold out (409 Conflict, or 400/422 with 'sold out', 'epuise', 'complet', 'no seats')
+                # In this case, do NOT burst retry this sold-out category; break burst and cascade to next category
+                if status in (400, 404, 409, 422):
+                    logger.info(f"Category '{cat}' unavailable (HTTP {status}), checking next fallback tier...")
+                    break
+                else:
+                    # Fatal error (e.g. 401 Unauthorized, 403 Forbidden)
+                    break
+
+        return last_result or ExecutionResult(
+            action_id=f"ticket_{uuid.uuid4().hex[:8]}",
+            success=False,
+            status_code=0,
+            data={},
+            latency_ms=0.0,
+            error="All ticket categories failed",
+        )
+
+    async def execute_parallel_categories(
+        self,
+        categories: Optional[List[str]] = None,
+        stagger_delay_ms: float = 0.0,
+    ) -> ExecutionResult:
+        """
+        Executes reservation requests for multiple categories concurrently over the pre-warmed connection.
+        First successful reservation (HTTP 200/201) wins, and active_cart is secured.
+        stagger_delay_ms allows prioritizing primary categories with a small head start.
+        """
+        target_cats = categories or ([self.config.category_id] + self.config.fallback_categories)
+        if not target_cats:
+            return ExecutionResult(
+                action_id=f"ticket_{uuid.uuid4().hex[:8]}",
+                success=False,
+                status_code=0,
+                data={},
+                latency_ms=0.0,
+                error="No categories specified",
+            )
+
+        async def _attempt_cat(cat: str, delay_ms: float) -> ExecutionResult:
+            if delay_ms > 0:
+                await asyncio.sleep(delay_ms / 1000.0)
             signal = Signal(
                 source="ticket_engine",
                 target_id=self.config.event_id,
@@ -182,27 +269,30 @@ class TicketDropExecutor(BaseExecutor):
                 },
                 urgency=3,
             )
+            return await self.execute(signal)
 
-            res = await self.execute(signal)
+        tasks = [
+            asyncio.create_task(_attempt_cat(cat, idx * stagger_delay_ms))
+            for idx, cat in enumerate(target_cats)
+        ]
+
+        last_res: Optional[ExecutionResult] = None
+        for completed_task in asyncio.as_completed(tasks):
+            res = await completed_task
             if res.success:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
                 return res
+            last_res = res
 
-            last_result = res
-            # If server indicates sold out or invalid category, attempt next fallback immediately
-            if res.status_code in (400, 404, 409, 422):
-                logger.info(f"Category '{cat}' unavailable (HTTP {res.status_code}), attempting next tier...")
-                continue
-            else:
-                # Fatal network error or server down, stop
-                break
-
-        return last_result or ExecutionResult(
+        return last_res or ExecutionResult(
             action_id=f"ticket_{uuid.uuid4().hex[:8]}",
             success=False,
             status_code=0,
             data={},
             latency_ms=0.0,
-            error="All ticket categories failed",
+            error="All parallel category attempts failed",
         )
 
     async def execute(self, signal: Signal) -> ExecutionResult:
@@ -307,34 +397,82 @@ class TicketDropExecutor(BaseExecutor):
         self,
         poll_interval_sec: float = 0.5,
         max_duration_sec: float = 900.0,
+        categories: Optional[List[str]] = None,
+        wave_windows_sec: Optional[List[tuple[float, float]]] = None,
+        wave_poll_interval_sec: float = 0.15,
+        jitter_ms: float = 25.0,
     ) -> Optional[ExecutionResult]:
         """
-        Cart Release Sniping:
-        Polls the availability endpoint rapidly when carts expire (10-15 min after drop)
-        to instantly snatch any returned inventory.
+        Cart Release Sniping (Rattrapage multi-vagues des paniers expirés):
+        Polls availability for primary and fallback categories when unpurchased carts expire.
+        
+        - Automatically switches to fast burst mode (wave_poll_interval_sec) during wave windows
+          (e.g. at 10 min [570-660s] and 15 min [870-960s] marks).
+        - Applies pseudo-random jitter to prevent cyclic rate-limiting.
+        - Respects HTTP 429 Retry-After headers automatically.
+        - Snipes returned inventory the millisecond it appears.
         """
         start_time = time.time()
-        logger.info(f"Starting cart release monitor for event {self.config.event_id} (interval {poll_interval_sec}s)...")
+        watched_cats = categories or ([self.config.category_id] + self.config.fallback_categories)
+        if not wave_windows_sec:
+            # Default typical ticketing cart expiration cycles: 10 min (570-660s) and 15 min (870-960s)
+            wave_windows_sec = [(570.0, 660.0), (870.0, 960.0)]
 
+        logger.info(
+            f"Starting cart release monitor for event {self.config.event_id} "
+            f"(categories: {watched_cats}, duration: {max_duration_sec}s)..."
+        )
         headers = self._prepare_headers()
 
         while time.time() - start_time < max_duration_sec:
-            check_endpoint = f"/api/events/{self.config.event_id}/availability?cat={self.config.category_id}"
-            res = await self.client.execute_fast(
-                method="GET",
-                endpoint=check_endpoint,
-                action_id=f"poll_{uuid.uuid4().hex[:6]}",
-                headers=headers,
-            )
+            elapsed = time.time() - start_time
+            in_wave = any(w_start <= elapsed <= w_end for w_start, w_end in wave_windows_sec)
+            current_interval = wave_poll_interval_sec if in_wave else poll_interval_sec
 
-            if res.get("status_code") == 200:
-                body = res.get("body", {})
-                available = body.get("available", 0) or body.get("seats_left", 0)
-                if available >= self.config.quantity:
-                    logger.info(f"[CART RELEASE DETECTED] {available} seats found! Executing instant reservation...")
-                    return await self.execute_drop()
+            for cat in watched_cats:
+                check_endpoint = f"/api/events/{self.config.event_id}/availability?cat={cat}"
+                res = await self.client.execute_fast(
+                    method="GET",
+                    endpoint=check_endpoint,
+                    action_id=f"poll_{uuid.uuid4().hex[:6]}",
+                    headers=headers,
+                )
 
-            await asyncio.sleep(poll_interval_sec)
+                status = res.get("status_code", 0)
+
+                # Rate limiting awareness (429)
+                if status == 429:
+                    retry_after = float(res.get("headers", {}).get("retry-after", 2.0))
+                    logger.warning(f"HTTP 429 Rate limited on availability check. Backing off for {retry_after}s.")
+                    await asyncio.sleep(retry_after)
+                    break
+
+                if status == 200:
+                    body = res.get("body", {})
+                    available = body.get("available", 0) or body.get("seats_left", 0)
+                    if available >= self.config.quantity:
+                        logger.info(f"[CART RELEASE DETECTED] {available} seats found in category '{cat}'! Executing instant reservation...")
+                        signal = Signal(
+                            source="ticket_engine",
+                            target_id=self.config.event_id,
+                            action="RESERVE_TICKETS",
+                            payload={
+                                "event_id": self.config.event_id,
+                                "category_id": cat,
+                                "quantity": self.config.quantity,
+                                "auth_token": self.config.auth_token,
+                                "idempotency_key": f"ticket_release_{self.config.event_id}_{cat}_{uuid.uuid4().hex[:8]}",
+                            },
+                            urgency=3,
+                        )
+                        reserve_res = await self.execute(signal)
+                        if reserve_res.success:
+                            return reserve_res
+
+            # Apply interval with jitter
+            jitter = (random.uniform(-jitter_ms, jitter_ms)) / 1000.0 if jitter_ms > 0 else 0.0
+            sleep_duration = max(0.005, current_interval + jitter)
+            await asyncio.sleep(sleep_duration)
 
         logger.info("Cart release monitoring window expired.")
         return None

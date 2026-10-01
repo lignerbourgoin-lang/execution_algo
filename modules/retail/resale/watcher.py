@@ -13,7 +13,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence
 
 import httpx
 
@@ -150,11 +150,13 @@ class ResaleWatcher:
         config: ResaleWatchConfig,
         notifiers: Sequence[Notifier],
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        auto_reserve_action: Optional[Callable[[Listing], Coroutine[Any, Any, Any]]] = None,
     ):
         if not notifiers:
             raise ValueError("At least one notifier is required (an unseen alert is a no-op)")
         self.config = config
         self.notifiers = list(notifiers)
+        self.auto_reserve_action = auto_reserve_action
         self._seen_listing_ids: "OrderedDict[str, None]" = OrderedDict()
         self._is_first_batch = True
         self.alerts_sent = 0
@@ -190,12 +192,25 @@ class ResaleWatcher:
 
     async def handle_document(self, document: Any, received_ns: int) -> None:
         for listing in self.select_new_matches(document):
+            checkout_url = listing.url
+            reserved_cart = None
+            if self.auto_reserve_action:
+                try:
+                    reserved_cart = await self.auto_reserve_action(listing)
+                    if reserved_cart and hasattr(reserved_cart, "checkout_url"):
+                        checkout_url = reserved_cart.checkout_url
+                    elif isinstance(reserved_cart, dict) and "checkout_url" in reserved_cart:
+                        checkout_url = reserved_cart["checkout_url"]
+                except Exception as e:
+                    logger.warning("Auto-reserve for listing %s failed: %r", listing.listing_id, e)
+
             price_text = f"{listing.price} EUR" if listing.price is not None else "prix inconnu"
             quantity_text = f" x{listing.quantity}" if listing.quantity is not None else ""
+            title_prefix = "🎟️ [PANIER VERROUILLÉ] " if reserved_cart else "Revente : "
             notification = Notification(
-                title=f"Revente : {listing.title or listing.listing_id}",
-                message=f"{price_text}{quantity_text}",
-                url=listing.url,
+                title=f"{title_prefix}{listing.title or listing.listing_id}",
+                message=f"{price_text}{quantity_text}" + (" (Réservé au panier !)" if reserved_cart else ""),
+                url=checkout_url,
                 is_urgent=True,
             )
             await broadcast(self.notifiers, notification)
