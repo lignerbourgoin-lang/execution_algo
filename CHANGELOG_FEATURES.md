@@ -53,3 +53,14 @@
 - Bouton de transfert en 1 clic injectant la session de l'IP gagnante dans l'onglet de réservation.
 **Attention**:
 - Le thread UI reste strictement isolé du thread worker asynchrone pour ne pas altérer la précision temporelle à l'ouverture.
+
+## [2026-10-01] HEADLESS_QUEUE_WORKER
+**Fichiers**: `modules/retail/tickets/queue_worker.py`, `modules/retail/tickets/__init__.py`, `tests/test_queue_worker.py`
+**Raison**: Automatisation complète du passage de file d'attente virtuelle via Google Chrome/Playwright et transmission instantanée du jeton d'admission signé vers le moteur HTTP/2 rapide.
+**Logique**:
+- Détection automatique du binaire Google Chrome système (`C:\Program Files\Google\Chrome\Application\chrome.exe`) sans téléchargement tiers.
+- Lancement de contextes isolés avec proxy dédié et arguments anti-détection (`--disable-blink-features=AutomationControlled`).
+- Surveillance asynchrone continue de l'admission (redirection d'URL et apparition de cookies de file signés type `QueueITAccepted`).
+- Extraction immédiate des cookies et du User-Agent dans une structure typée `AdmissionHandoff` pour alimenter le moteur d'exécution en moins d'une milliseconde.
+**Attention**:
+- Chaque instance de worker doit tourner sur un contexte navigateur isolé et un proxy sticky dédié pour éviter l'invalidation de session.

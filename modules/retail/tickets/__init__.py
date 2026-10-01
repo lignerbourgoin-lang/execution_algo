@@ -12,6 +12,12 @@ from modules.retail.tickets.lottery_selector import (
     LotteryTicket,
     MultiIpLotteryOrchestrator,
 )
+from modules.retail.tickets.queue_worker import (
+    AdmissionHandoff,
+    HeadlessQueueWorker,
+    QueueWorkerConfig,
+    find_chrome_executable,
+)
 from modules.retail.tickets.ticket_engine import (
     CartReservation,
     TicketConfig,
@@ -25,4 +31,8 @@ __all__ = [
     "LotteryTicket",
     "LotteryQueueSelector",
     "MultiIpLotteryOrchestrator",
+    "HeadlessQueueWorker",
+    "QueueWorkerConfig",
+    "AdmissionHandoff",
+    "find_chrome_executable",
 ]
