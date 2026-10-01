@@ -12,3 +12,15 @@
 **Attention**:
 - Une adresse IP générée en mémoire ne peut être utilisée comme adresse source sortante sur Internet que si elle est préalablement provisionnée et routée sur les interfaces réseau de la machine hôte.
 - Pour des adresses publiques distantes sans infrastructure multi-IP locale, utiliser un pool de proxies HTTP/SOCKS5.
+
+## [2026-10-01] LOTTERY_QUEUE_SELECTOR
+**Fichiers**: `modules/retail/tickets/lottery_selector.py`, `modules/retail/tickets/__init__.py`, `tests/test_lottery_selector.py`
+**Raison**: Dans les files d'attente virtuelles (Queue-It, Ticketmaster, AXS), les numéros de passage ("tombola" ou queue rank) attribués aux différentes adresses IP sont aléatoires. L'algorithme conserve uniquement les meilleurs numéros (les plus petits) pour concentrer l'exécution sur les sessions admises.
+**Logique**:
+- Enregistrement thread-safe des tickets de tombola/file par IP et session via `LotteryQueueSelector`.
+- Tri et sélection des Top-K meilleurs numéros (`lower_is_better=True` par défaut pour les positions de file).
+- Filtrage par seuil de coupure (`max_acceptable_position`) pour éliminer immédiatement les positions sans espoir (ex: position 50 000 quand il y a 2 000 places).
+- Élagage propre (`prune_non_viable`) séparant les tickets "selected" des "discarded" pour fermer les sockets et sessions inutiles.
+- Orchestration asynchrone concurrente (`MultiIpLotteryOrchestrator`) avec sémaphore de concurrence et timeout par IP.
+**Attention**:
+- Un numéro de file bas ne garantit l'achat que si le token/cookie de session associé à cette IP est conservé pour la phase de checkout.

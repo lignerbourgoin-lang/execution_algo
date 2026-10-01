@@ -7,6 +7,11 @@ Automated ticketing drops, clock synchronization, and cart release sniping:
 - TicketDropExecutor
 """
 
+from modules.retail.tickets.lottery_selector import (
+    LotteryQueueSelector,
+    LotteryTicket,
+    MultiIpLotteryOrchestrator,
+)
 from modules.retail.tickets.ticket_engine import (
     CartReservation,
     TicketConfig,
@@ -17,4 +22,7 @@ __all__ = [
     "TicketConfig",
     "CartReservation",
     "TicketDropExecutor",
+    "LotteryTicket",
+    "LotteryQueueSelector",
+    "MultiIpLotteryOrchestrator",
 ]
