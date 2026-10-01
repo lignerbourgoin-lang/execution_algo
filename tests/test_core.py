@@ -132,6 +132,19 @@ class TestLatencyTracker(unittest.TestCase):
         self.assertEqual(data["traces"][0]["action_id"], "act_audit")
         os.remove(tmp_path)
 
+    def test_check_preflight_sla(self):
+        tracker = LatencyTracker()
+        # No runs: p95 is 0.0
+        sla_clean = tracker.check_preflight_sla(p95_threshold_ms=50.0, clock_offset_ms=12.5)
+        self.assertTrue(sla_clean["passed"])
+        self.assertEqual(len(sla_clean["violations"]), 0)
+
+        # Clock offset violation
+        sla_drift = tracker.check_preflight_sla(clock_offset_ms=75.0, max_clock_offset_ms=50.0)
+        self.assertFalse(sla_drift["passed"])
+        self.assertIn("Clock drift", sla_drift["violations"][0])
+
+
 
 
 class MockStrategy(BaseStrategy):

@@ -147,19 +147,30 @@ class TicketDropExecutor(BaseExecutor):
         self.prebuild_reservation_requests()
         self.is_armed = True
 
-    async def execute_drop(self) -> ExecutionResult:
+    # [FEATURE: FLEXIBLE_SCHEDULING_DISPATCH] Support orchestrated external scheduling and custom target timestamps
+    # Raison: Prevents staggered orchestrator tiers from collapsing onto T0 or double-waiting internally.
+    # Attention: skip_scheduling=True must only be set when the caller manages sub-millisecond dispatch.
+    async def execute_drop(
+        self,
+        skip_scheduling: bool = False,
+        custom_target_utc: Optional[float] = None,
+    ) -> ExecutionResult:
         """
         Executes drop reservation at the exact scheduled millisecond.
+        If skip_scheduling is True, bypasses internal scheduler wait and fires immediately.
+        If custom_target_utc is provided, coordinates against that specific target epoch.
         Includes automatic 15-second drift resync, GC freeze, and CPU affinity pinning.
         """
         if not self.is_armed:
             await self.initialize()
 
         now = time.time()
-        # Scheduled wait if drop time is configured
-        if self.config.drop_time_utc and self.config.drop_time_utc > now:
+        target_utc = custom_target_utc or self.config.drop_time_utc
+
+        # Scheduled wait if drop time is configured and scheduling is enabled
+        if not skip_scheduling and target_utc and target_utc > now:
             # If drop is more than 30s away, do a fine drift resync at T-15s
-            time_until_drop = self.config.drop_time_utc - now
+            time_until_drop = target_utc - now
             if time_until_drop > 30.0:
                 await asyncio.sleep(time_until_drop - 15.0)
                 try:
@@ -174,7 +185,7 @@ class TicketDropExecutor(BaseExecutor):
             # Freeze Python GC for the final millisecond firing path
             with freeze_garbage_collection():
                 await self.scheduler.wait_until_atomic_timestamp(
-                    target_atomic_timestamp_utc=self.config.drop_time_utc,
+                    target_atomic_timestamp_utc=target_utc,
                     latency_advance_ms=self.config.lead_time_ms,
                 )
                 return await self._execute_with_fallbacks()

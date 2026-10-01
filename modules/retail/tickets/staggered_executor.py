@@ -95,15 +95,30 @@ class StaggeredDropOrchestrator:
         total_dispatched = 0
         all_tasks: List[asyncio.Task] = []
 
+        # [FEATURE: STAGGERED_TIMING_SYNC] Synchronize tier offsets relative to T0 target epoch
+        # Raison: Prevents individual executors from re-waiting until T0 and collapsing all tiers into a single wave.
+        # Attention: skip_scheduling=True avoids blocking the event loop on multiple simultaneous spin-waits.
+        base_drop_utc = self.config.drop_time_utc
+        if base_drop_utc is None and active_executors:
+            base_drop_utc = getattr(active_executors[0].config, "drop_time_utc", None)
+
         # 3. Dispatch tiers with delay offsets
         async def run_single_executor(
             executor: TicketDropExecutor,
             tier_idx: int,
-            delay_sec: float,
+            tier_delay_sec: float,
         ) -> Optional[tuple[ExecutionResult, TicketDropExecutor, int]]:
-            if delay_sec > 0:
+            if base_drop_utc is not None and base_drop_utc > time.time():
+                target_tier_epoch = base_drop_utc + tier_delay_sec
+                remaining = target_tier_epoch - time.time()
+                if remaining > 0:
+                    try:
+                        await asyncio.sleep(remaining)
+                    except asyncio.CancelledError:
+                        return None
+            elif tier_delay_sec > 0:
                 try:
-                    await asyncio.sleep(delay_sec)
+                    await asyncio.sleep(tier_delay_sec)
                 except asyncio.CancelledError:
                     return None
 
@@ -111,7 +126,11 @@ class StaggeredDropOrchestrator:
                 return None
 
             try:
-                result = await executor.execute_drop()
+                try:
+                    result = await executor.execute_drop(skip_scheduling=True)
+                except TypeError:
+                    result = await executor.execute_drop()
+
                 ip_addr = getattr(executor.client, "bound_ip", None) or executor.config.target_url
 
                 if result.success and executor.active_cart is not None:

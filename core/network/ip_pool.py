@@ -155,19 +155,28 @@ class SubnetIpPool:
         except (OSError, ValueError):
             return False
 
+    # [FEATURE: KEEP_ALIVE_POOL_LIMITS] Set transport limits to prevent premature keepalive connection closures
+    # Raison: httpx.AsyncHTTPTransport defaults to keepalive_expiry=5.0s, closing sockets between 20s heartbeats.
+    # Attention: limits passed to AsyncClient are ignored when custom transport is supplied.
+    DEFAULT_KEEPALIVE_EXPIRY_SEC = 60.0
+    DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 20
+    DEFAULT_MAX_CONNECTIONS = 50
+
     def create_transport(
         self,
         local_address: Optional[str] = None,
         http2: bool = True,
         verify_binding: bool = False,
+        limits: Optional[httpx.Limits] = None,
     ) -> httpx.AsyncHTTPTransport:
         """
-        Creates an httpx.AsyncHTTPTransport configured with the specified local source IP address.
+        Creates an httpx.AsyncHTTPTransport configured with the specified local source IP address and connection limits.
 
         Args:
             local_address: Source IP to bind to. If None, next_ip() is used.
             http2: Whether HTTP/2 is enabled on the transport.
             verify_binding: If True, validates local assignment before transport creation.
+            limits: Optional custom httpx.Limits. If omitted, uses 60s keepalive and 20 max keepalive connections.
 
         Raises:
             OSError: If verify_binding is True and IP is not provisioned on local OS interface.
@@ -180,4 +189,14 @@ class SubnetIpPool:
                 "to any local network interface on this machine."
             )
 
-        return httpx.AsyncHTTPTransport(local_address=target_ip, http2=http2)
+        effective_limits = limits or httpx.Limits(
+            max_keepalive_connections=self.DEFAULT_MAX_KEEPALIVE_CONNECTIONS,
+            max_connections=self.DEFAULT_MAX_CONNECTIONS,
+            keepalive_expiry=self.DEFAULT_KEEPALIVE_EXPIRY_SEC,
+        )
+
+        return httpx.AsyncHTTPTransport(
+            local_address=target_ip,
+            http2=http2,
+            limits=effective_limits,
+        )

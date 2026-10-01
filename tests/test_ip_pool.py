@@ -109,6 +109,12 @@ class TestSubnetIpPool(unittest.TestCase):
         # Binding to 127.0.0.1 with verification succeeds
         transport = pool.create_transport(local_address="127.0.0.1", verify_binding=True)
         self.assertIsInstance(transport, httpx.AsyncHTTPTransport)
+        self.assertEqual(getattr(transport._pool, "_keepalive_expiry", None), 60.0)
+
+        # Custom limits are respected
+        custom_limits = httpx.Limits(keepalive_expiry=120.0, max_connections=100)
+        custom_transport = pool.create_transport(local_address="127.0.0.1", limits=custom_limits)
+        self.assertEqual(getattr(custom_transport._pool, "_keepalive_expiry", None), 120.0)
 
         # Binding to an unassigned IP with verify_binding=True raises OSError
         with self.assertRaises(OSError):

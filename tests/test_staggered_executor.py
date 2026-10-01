@@ -144,6 +144,55 @@ class TestStaggeredDropOrchestrator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.winning_executor.client.bound_ip, "10.0.0.2")
         self.assertEqual(result.total_dispatched, 1)
 
+    async def test_future_drop_time_stagger_offset(self):
+        import time
+        fire_timestamps = {}
+
+        class TimingExecutor(TicketDropExecutor):
+            def __init__(self, config, client, ip_label: str):
+                super().__init__(config=config, http_client=client)
+                self.ip_label = ip_label
+
+            async def execute_drop(self, skip_scheduling: bool = False, custom_target_utc=None):
+                fire_timestamps[self.ip_label] = time.time()
+                # Fail all so all tiers fire
+                return ExecutionResult(action_id="fail", success=False, status_code=503, data={}, latency_ms=1.0)
+
+        config = TicketConfig(
+            platform_name="billetterie_test",
+            target_url="https://billetterie.example.com",
+            event_id="STAGGER-FUTURE",
+            category_id="CARRE_OR",
+            quantity=1,
+            auto_open_browser=False,
+            audible_alert=False,
+        )
+
+        exec1 = TimingExecutor(config, DummyMockClient("10.0.0.1"), "tier0")
+        exec2 = TimingExecutor(config, DummyMockClient("10.0.0.2"), "tier1")
+
+        future_t0 = time.time() + 0.05
+        stagger_config = StaggerConfig(
+            stagger_interval_ms=40.0,
+            sessions_per_tier=1,
+            drop_time_utc=future_t0,
+            max_wait_sec=2.0,
+        )
+
+        orchestrator = StaggeredDropOrchestrator(
+            executors=[exec1, exec2],
+            config=stagger_config,
+        )
+        result = await orchestrator.execute_staggered_drop()
+
+        self.assertFalse(result.success)
+        self.assertIn("tier0", fire_timestamps)
+        self.assertIn("tier1", fire_timestamps)
+        delta_sec = fire_timestamps["tier1"] - fire_timestamps["tier0"]
+        # Tier 1 must fire approximately 40ms after Tier 0
+        self.assertGreater(delta_sec, 0.025)
+        self.assertLess(delta_sec, 0.080)
+
 
 if __name__ == "__main__":
     unittest.main()

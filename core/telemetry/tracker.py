@@ -130,3 +130,37 @@ class LatencyTracker:
 
         return destination_path
 
+    # [FEATURE: PREFLIGHT_SLA_CHECK] Automated pre-T0 SLA verification
+    # Raison: Prevents firing a drop when proxy latency has degraded or clock drift is unacceptable.
+    # Attention: Returns a dict with passed (bool), violations (list), and measured statistics.
+    def check_preflight_sla(
+        self,
+        p95_threshold_ms: float = 120.0,
+        clock_offset_ms: Optional[float] = None,
+        max_clock_offset_ms: float = 50.0,
+    ) -> Dict[str, Any]:
+        """
+        Validates whether prewarm traces and clock synchronization satisfy firing SLA requirements.
+        """
+        summary = self.get_summary()
+        violations: List[str] = []
+
+        measured_p95 = summary.get("p95_ms", 0.0)
+        if measured_p95 > p95_threshold_ms:
+            violations.append(
+                f"Network latency p95 ({measured_p95:.1f} ms) exceeds SLA threshold ({p95_threshold_ms:.1f} ms)"
+            )
+
+        if clock_offset_ms is not None and abs(clock_offset_ms) > max_clock_offset_ms:
+            violations.append(
+                f"Clock drift ({abs(clock_offset_ms):.1f} ms) exceeds tolerance ({max_clock_offset_ms:.1f} ms)"
+            )
+
+        return {
+            "passed": (len(violations) == 0),
+            "p95_ms": measured_p95,
+            "clock_offset_ms": clock_offset_ms,
+            "violations": violations,
+        }
+
+

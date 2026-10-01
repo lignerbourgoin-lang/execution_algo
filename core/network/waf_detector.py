@@ -32,15 +32,9 @@ def detect_waf_challenge(
     Inspects response status code, HTTP headers, and response payload
     to identify whether a WAF blocked the request or requires browser interaction.
     """
-    if status_code in (200, 201, 204, 301, 302, 304):
-        return WafDetectionResult(
-            is_blocked=False,
-            is_interactive_challenge=False,
-            waf_name="none",
-            reason="Response is healthy",
-            should_handover_to_browser=False,
-        )
-
+    # [FEATURE: WAF_WAITING_ROOM_DETECTION] Catch Queue-it redirects and Turnstile 200 OK interstitials
+    # Raison: Virtual waiting rooms (Queue-it) often return HTTP 302 redirect or 200 OK with JS queue clients.
+    # Attention: Blindly assuming 200/302 is healthy causes ticket engine to crash on missing JSON tokens.
     headers_dict = {k.lower(): str(v).lower() for k, v in (headers or {}).items()}
     body_str = ""
     if body_text_or_bytes is not None:
@@ -52,11 +46,49 @@ def detect_waf_challenge(
         else:
             body_str = str(body_text_or_bytes).lower()
 
-    # 1. Cloudflare Detection
+    location_header = headers_dict.get("location", "")
+
+    # 1. Queue-it Virtual Waiting Room Detection (can occur on 200, 302, 303, 307)
+    is_queue_it = (
+        "queue-it.net" in location_header
+        or "queue-it.net" in body_str
+        or "x-queueit-challengerange" in headers_dict
+        or "queueviewmodel" in body_str
+        or ("waiting-room" in location_header and "queue" in location_header)
+    )
+    if is_queue_it:
+        return WafDetectionResult(
+            is_blocked=True,
+            is_interactive_challenge=True,
+            waf_name="queue_it",
+            reason="Queue-it virtual waiting room redirect/page detected",
+            should_handover_to_browser=True,
+        )
+
+    # 2. Cloudflare Detection
     server_header = headers_dict.get("server", "")
     has_cf_ray = "cf-ray" in headers_dict
     has_cf_mitigated = "cf-mitigated" in headers_dict or headers_dict.get("cf-mitigated") == "challenge"
     is_cloudflare = "cloudflare" in server_header or has_cf_ray
+
+    if is_cloudflare and status_code == 200:
+        if any(marker in body_str for marker in ("challenges.cloudflare.com/turnstile", "turnstile-wrapper", "cf-turnstile")):
+            return WafDetectionResult(
+                is_blocked=True,
+                is_interactive_challenge=True,
+                waf_name="cloudflare",
+                reason="Cloudflare Turnstile challenge interstitial detected on 200 OK",
+                should_handover_to_browser=True,
+            )
+
+    if status_code in (200, 201, 204, 301, 302, 304):
+        return WafDetectionResult(
+            is_blocked=False,
+            is_interactive_challenge=False,
+            waf_name="none",
+            reason="Response is healthy",
+            should_handover_to_browser=False,
+        )
 
     if is_cloudflare:
         # Turnstile or Managed Challenge

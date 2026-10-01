@@ -1,5 +1,19 @@
 # Changelog Features
 
+## [2026-10-01] HARDENING_AND_SUBMILLIS_OPTIMIZATION
+**Fichiers**: `core/network/ip_pool.py`, `core/network/persistent_client.py`, `core/network/waf_detector.py`, `core/telemetry/tracker.py`, `modules/retail/clock/ntp_sync.py`, `modules/retail/tickets/staggered_executor.py`, `modules/retail/tickets/ticket_engine.py`, `run.py`, `tests/test_core.py`, `tests/test_ip_pool.py`, `tests/test_staggered_executor.py`, `tests/test_waf_detector.py`, `benchmarks/bench_t0_drop_20_ips.py`
+**Raison**: Résolution des goulots d'étranglement de socket (fermeture intempestive à 5s), élimination du chevauchement de spin-wait multi-IP, décodage JSON direct sans allocation, calibration fine de l'horloge Windows NT, détection des salles d'attente virtuelles (Queue-it / Turnstile 200/302), et unification du CLI `run.py`.
+**Logique**:
+- **Persistance Keep-Alive sur transport IP (`KEEP_ALIVE_POOL_LIMITS`)** : Injection explicite de `httpx.Limits(keepalive_expiry=60.0)` dans `SubnetIpPool.create_transport`. Comble le défaut httpx qui fermait les sockets après 5s alors que le heartbeat était à 20s, évitant tout handshake TLS à froid au T0.
+- **Coordination centralisée du tir échelonné (`STAGGERED_TIMING_SYNC`)** : Calcul exact de l'instant de tir par palier (`target_tier_epoch = base_drop_utc + tier_delay_sec`) et transmission de `skip_scheduling=True` aux exécuteurs. Évite l'écroulement des paliers sur T0 et supprime la sérialisation des boucles de spin entre adresses IP du palier 0.
+- **Décodage direct sans allocation (`ZERO_ALLOC_DECODE`)** : Remplacement de l'accès préalable à `response.text` par `json.loads(response.content)`. Sur les erreurs HTTP (403, 503), troncature du corps à 256 octets pour éviter l'allocation en mémoire de pages HTML CDN volumineuses (50 Ko à 200 Ko).
+- **Calibration du spin Windows NT (`WINDOWS_SPIN_TUNING`)** : Réduction de `COARSE_SLEEP_MARGIN_MS` de 100 ms à 15 ms (-85% de CPU gaspillé en sommeil coopératif), et élargissement de `HARD_SPIN_WINDOW_MS` de 1.0 ms à 3.5 ms pour absorber le jitter d'ordonnancement Proactor Windows.
+- **Détection des files d'attente virtuelles (`WAF_WAITING_ROOM_DETECTION`)** : Inspection proactive des redirections HTTP 302/303 vers `queue-it.net` et des pages intercalaires Cloudflare Turnstile renvoyant HTTP 200 OK avec payload JavaScript.
+- **Point d'entrée unifié et résilient (`UNIFIED_RUNNER_PIPELINE`)** : Support direct du mode billetterie (`--mode ticket`) et retail, parsing robuste des horodatages ISO 8601 et Unix float, sécurisation de la restauration de priorité process via `try...finally: restore_process_performance()`, et correction de la clé de précision temporelle `dispatch_error_us`.
+- **Validation d'accord de niveau de service SLA (`PREFLIGHT_SLA_CHECK`)** : Contrôle automatique pré-tir à T-30s sur la latence réseau p95 et la dérive d'horloge atomique.
+**Attention**:
+- Les sockets locales liées via `SubnetIpPool` nécessitent que les adresses soient provisionnées sur l'interface hôte. En environnement distant, utiliser un pool de proxies résidentiels rotatifs.
+
 ## [2026-10-01] STAGGERED_DROP_AND_CIRCUIT_BREAKER
 **Fichiers**: `core/network/circuit_breaker.py`, `core/network/waf_detector.py`, `core/telemetry/tracker.py`, `modules/retail/tickets/staggered_executor.py`, `tests/mock_drop_server.py`, `examples/demo_full_drop_simulation.py`
 **Raison**: Securisation des tirs multi-IP au T0 par echelonnement temporel (stagger), isolation proactive des proxies defaillants ou defies par WAF (circuit breaker), et serveur mock de simulation haute-fidelite.

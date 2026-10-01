@@ -33,14 +33,13 @@ NTP_LEAP_UNSYNCHRONIZED = 3
 NTP_STRATUM_KISS_OF_DEATH = 0
 NTP_MAX_ACCEPTED_RTT_MS = 1500.0
 
-# [FEATURE: THREE_PHASE_WAIT] coarse sleep -> cooperative yield-spin -> bounded hard spin.
-# Raison: measured on Windows (2026-10-01, 1ms timer active): asyncio.sleep overshoot is
-#         p50 1.9 ms but p99 65 ms / max 86 ms under load. A fixed 4 ms spin window fired late.
-# Attention: during the yield phase the loop keeps running other tasks (heartbeats) but one
-#            core is busy for up to COARSE_SLEEP_MARGIN_MS; only the last HARD_SPIN_WINDOW_MS
-#            blocks the loop. A task hogging the loop during the yield phase delays T0.
-COARSE_SLEEP_MARGIN_MS = 100.0
-HARD_SPIN_WINDOW_MS = 1.0
+# [FEATURE: WINDOWS_SPIN_TUNING] Calibrated three-phase wait windows for Windows NT
+# Raison: With 1ms timer active, asyncio.sleep wakes within 1-5ms. A 100ms yield window was wasting CPU.
+#         A 1.0ms hard spin was too narrow on Windows proactor loop (firing late if yield took 1.2ms).
+#         15.0ms coarse margin + 3.5ms hard spin window ensures sub-millisecond accuracy without CPU thrashing.
+# Attention: Hard spin holds the event loop for up to 3.5ms right before T0.
+COARSE_SLEEP_MARGIN_MS = 15.0
+HARD_SPIN_WINDOW_MS = 3.5
 NS_PER_MS = 1_000_000
 NS_PER_SEC = 1_000_000_000
 

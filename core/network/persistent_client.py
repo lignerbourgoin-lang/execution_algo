@@ -9,6 +9,7 @@ between the heartbeat and the critical request.
 
 import asyncio
 import importlib.util
+import json
 import logging
 import time
 from typing import Any, Dict, Optional
@@ -189,13 +190,20 @@ class PrewarmedHttpClient:
         trace.mark_stage("response_received")
         self.rate_limiter.on_response(response.status_code, dict(response.headers))
 
+        # [FEATURE: ZERO_ALLOC_DECODE] Fast response body parsing avoiding redundant string allocations
+        # Raison: response.text decodes the full byte stream into Python str even if parsed as JSON.
+        # Attention: on error statuses (>= 400), large HTML error payloads are truncated to 256 bytes.
         content_type = response.headers.get("content-type", "")
-        body: Any = response.text
+        body: Any = None
         if "application/json" in content_type:
             try:
-                body = response.json()
-            except ValueError:
-                logger.warning("Invalid JSON body from %s despite content-type", request.url)
+                body = json.loads(response.content)
+            except Exception:
+                body = response.text[:256]
+        elif response.status_code >= 400:
+            body = response.text[:256]
+        else:
+            body = response.text
 
         trace.complete(success=(response.status_code < 400))
         return {

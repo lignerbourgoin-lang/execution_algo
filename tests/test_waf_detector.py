@@ -71,6 +71,29 @@ class TestWafDetector(unittest.TestCase):
         self.assertEqual(result.waf_name, "akamai")
         self.assertFalse(result.should_handover_to_browser)
 
+    def test_queue_it_redirect_detected(self):
+        headers = {
+            "Location": "https://ticketmaster.queue-it.net/?c=ticketmaster&e=event123",
+            "Server": "cloudflare",
+        }
+        result = detect_waf_challenge(302, headers=headers)
+        self.assertTrue(result.is_blocked)
+        self.assertTrue(result.is_interactive_challenge)
+        self.assertEqual(result.waf_name, "queue_it")
+        self.assertTrue(result.should_handover_to_browser)
+
+    def test_cloudflare_turnstile_200_interstitial(self):
+        headers = {
+            "Server": "cloudflare",
+            "CF-Ray": "91a2b3c4d5e6",
+        }
+        body = '<html><body><script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script><div class="cf-turnstile"></div></body></html>'
+        result = detect_waf_challenge(200, headers=headers, body_text_or_bytes=body)
+        self.assertTrue(result.is_blocked)
+        self.assertTrue(result.is_interactive_challenge)
+        self.assertEqual(result.waf_name, "cloudflare")
+        self.assertTrue(result.should_handover_to_browser)
+
 
 if __name__ == "__main__":
     unittest.main()
