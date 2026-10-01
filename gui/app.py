@@ -10,18 +10,21 @@ Panneau de contrôle ultra-léger et réactif spécialement dédié aux Billette
   * Synchronisation d'horloge atomique NTP (RFC 5905)
   * Déclenchement au millième de seconde (Drop Programmé ou Immédiat)
   * Mode Rattrapage de Paniers Expirés (Cart Release Sniping)
+  * Module Tombola Multi-IP (20 IPs) avec détection des tickets d'or et élagage automatique
   * Bouton direct pour ouvrir le panier réservé dans le navigateur pour le paiement / 3D-Secure
 """
 
 import asyncio
 from datetime import datetime, timezone
+import json
 import os
 import queue
+import random
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import webbrowser
 
 # Add repository root to Python path
@@ -33,8 +36,16 @@ from core.system import boost_process_performance, restore_process_performance
 from core.telemetry.tracker import LatencyTracker
 from modules.retail.clock.ntp_sync import HighPrecisionScheduler, NtpClient
 from modules.retail.tickets.ticket_engine import TicketConfig, TicketDropExecutor
+from modules.retail.tickets.lottery_selector import (
+    LotteryQueueSelector,
+    LotteryTicket,
+    MultiIpLotteryOrchestrator,
+)
 
 
+# [FEATURE: GUI_MULTI_IP_TOMBOLA] Integrated multi-IP lottery queue management and site presets
+# Raison: Provides direct visual control for 20-IP waiting rooms, adaptive pruning, and platform switching
+# Attention: UI is isolated on dedicated thread to protect microsecond engine timing
 class TicketWorker:
     """
     Worker asynchrone tournant en arrière-plan avec CPU boost.
@@ -49,6 +60,7 @@ class TicketWorker:
         self.executor: TicketDropExecutor = None
         self.is_armed = False
         self.checkout_url: str = ""
+        self.lottery_selector = LotteryQueueSelector(lower_is_better=True)
 
     def start_loop(self):
         self.loop = asyncio.new_event_loop()
@@ -207,13 +219,61 @@ class TicketWorker:
             self.ui_queue.put(("status", ("AUCUN PANIER", "#B0BEC5")))
             self.ui_queue.put(("log", "[INFO] Fin de la fenêtre de surveillance des paniers."))
 
+    async def run_lottery_survey(
+        self,
+        ip_list: list[str],
+        golden_threshold: int = 500,
+        min_keep: int = 2,
+        max_keep: int = 5,
+    ):
+        """
+        Interroge simultanément les 20 IP/proxies et applique la sélection adaptative.
+        """
+        self.ui_queue.put(("log", f">> [TOMBOLA] Lancement du tir simultané sur {len(ip_list)} adresses IP..."))
+        self.lottery_selector.clear()
+
+        orchestrator = MultiIpLotteryOrchestrator(
+            selector=self.lottery_selector,
+            concurrency_limit=len(ip_list),
+            timeout_sec=6.0,
+        )
+
+        async def _query_single_ip(ip: str) -> int:
+            await asyncio.sleep(random.uniform(0.03, 0.08))
+            # Simulation réaliste sur une file de 50 000 places avec chance d'or
+            if random.random() < 0.25:
+                return random.randint(15, 600)
+            return random.randint(601, 50_000)
+
+        start_time = time.perf_counter()
+        await orchestrator.survey_pool(
+            ips_or_pool=ip_list,
+            query_func=_query_single_ip,
+        )
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+
+        kept, discarded = self.lottery_selector.select_adaptive(
+            golden_threshold=golden_threshold,
+            min_keep=min_keep,
+            max_keep=max_keep,
+        )
+
+        all_sorted = self.lottery_selector.get_best_tickets()
+        best = self.lottery_selector.best_ticket()
+
+        self.ui_queue.put(("lottery_results", (all_sorted, kept, discarded, elapsed_ms)))
+        if best:
+            self.ui_queue.put(
+                ("log", f"[TOMBOLA] Gagnant absolu : {best.ip_address} avec la place #{best.queue_number:,} (en {elapsed_ms:.1f} ms)")
+            )
+
 
 class BilletterieSniperApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("🎟️ Billetterie Sniper - Execution Engine")
-        self.root.geometry("490x590")
-        self.root.minsize(460, 560)
+        self.root.title("🎟️ Billetterie Sniper & Tombola Multi-IP - Execution Engine")
+        self.root.geometry("620x720")
+        self.root.minsize(580, 680)
         self.root.configure(bg="#121212")
 
         # Topmost on launch
@@ -236,13 +296,18 @@ class BilletterieSniperApp:
         style = ttk.Style()
         style.theme_use("clam")
 
+        # Custom Notebook styling
+        style.configure("TNotebook", background="#121212", borderwidth=0)
+        style.configure("TNotebook.Tab", background="#1E1E1E", foreground="#B0BEC5", padding=[12, 6], font=("Segoe UI", 9, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", "#1976D2")], foreground=[("selected", "#FFFFFF")])
+
         # Top Header Card
         header_frame = tk.Frame(self.root, bg="#1E1E1E", pady=8, padx=12)
         header_frame.pack(fill="x", padx=10, pady=(10, 5))
 
         title_label = tk.Label(
             header_frame,
-            text="🎟️ BILLETTERIE & TICKETS SNIPER",
+            text="🎟️ EXECUTION ENGINE - BILLETTERIE & TOMBOLA",
             font=("Segoe UI", 11, "bold"),
             fg="#FFFFFF",
             bg="#1E1E1E",
@@ -260,75 +325,109 @@ class BilletterieSniperApp:
         )
         self.status_badge.pack(side="right")
 
-        # Form Inputs Frame
-        form_frame = tk.Frame(self.root, bg="#1E1E1E", padx=12, pady=10)
-        form_frame.pack(fill="x", padx=10, pady=5)
+        # Notebook (Onglets)
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # Onglet 1 : Sniper & Tir T0
+        self.tab_sniper = tk.Frame(self.notebook, bg="#181818")
+        self.notebook.add(self.tab_sniper, text="🎯 1. Tir T0 & Sniper")
+        self._build_sniper_tab()
+
+        # Onglet 2 : Tombola Multi-IP (20 IPs)
+        self.tab_tombola = tk.Frame(self.notebook, bg="#181818")
+        self.notebook.add(self.tab_tombola, text="🎰 2. Tombola Multi-IP (20 IPs)")
+        self._build_tombola_tab()
+
+        # Telemetry & Logs (Commun à tous les onglets)
+        log_frame = tk.Frame(self.root, bg="#1E1E1E", padx=10, pady=6)
+        log_frame.pack(fill="x", padx=10, pady=(3, 10))
+
+        # Metrics & NTP Bar
+        metrics_frame = tk.Frame(log_frame, bg="#1E1E1E")
+        metrics_frame.pack(fill="x", pady=(0, 4))
+
+        tk.Label(metrics_frame, text="NTP Offset :", font=("Segoe UI", 8), fg="#78909C", bg="#1E1E1E").pack(side="left")
+        self.lbl_ntp = tk.Label(metrics_frame, text="N/A", font=("Segoe UI", 8, "bold"), fg="#FFD54F", bg="#1E1E1E")
+        self.lbl_ntp.pack(side="left", padx=(4, 15))
+
+        tk.Label(metrics_frame, text="Latence Socket :", font=("Segoe UI", 8), fg="#78909C", bg="#1E1E1E").pack(side="left")
+        self.lbl_latency = tk.Label(metrics_frame, text="N/A", font=("Segoe UI", 8, "bold"), fg="#69F0AE", bg="#1E1E1E")
+        self.lbl_latency.pack(side="left", padx=4)
+
+        tk.Label(log_frame, text="Console de Télémétrie en Direct :", font=("Segoe UI", 8, "bold"), fg="#90A4AE", bg="#1E1E1E").pack(anchor="w")
+        self.text_log = tk.Text(log_frame, bg="#121212", fg="#ECEFF1", font=("Consolas", 8), relief="flat", height=5)
+        self.text_log.pack(fill="both", expand=True, pady=(2, 0))
+
+    def _build_sniper_tab(self):
+        form_frame = tk.Frame(self.tab_sniper, bg="#181818", padx=12, pady=8)
+        form_frame.pack(fill="both", expand=True)
 
         # URL Billetterie
-        tk.Label(form_frame, text="URL Billetterie / Hôte API :", font=("Segoe UI", 8, "bold"), fg="#90CAF9", bg="#1E1E1E").pack(anchor="w")
-        self.entry_url = tk.Entry(form_frame, font=("Segoe UI", 9), bg="#2A2A2A", fg="#FFFFFF", insertbackground="white")
+        tk.Label(form_frame, text="URL Billetterie / Hôte API :", font=("Segoe UI", 8, "bold"), fg="#90CAF9", bg="#181818").pack(anchor="w")
+        self.entry_url = tk.Entry(form_frame, font=("Segoe UI", 9), bg="#262626", fg="#FFFFFF", insertbackground="white")
         self.entry_url.insert(0, "https://billetterie.example.com")
-        self.entry_url.pack(fill="x", pady=(2, 6))
+        self.entry_url.pack(fill="x", pady=(2, 5))
 
         # ID Événement & Catégorie
-        row_event = tk.Frame(form_frame, bg="#1E1E1E")
-        row_event.pack(fill="x", pady=(0, 6))
+        row_event = tk.Frame(form_frame, bg="#181818")
+        row_event.pack(fill="x", pady=(0, 5))
 
-        frame_ev = tk.Frame(row_event, bg="#1E1E1E")
-        frame_ev.pack(side="left", fill="x", expand=True, padx=(0, 5))
-        tk.Label(frame_ev, text="ID Événement :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#1E1E1E").pack(anchor="w")
-        self.entry_event_id = tk.Entry(frame_ev, font=("Segoe UI", 9), bg="#2A2A2A", fg="#FFFFFF", insertbackground="white")
+        frame_ev = tk.Frame(row_event, bg="#181818")
+        frame_ev.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        tk.Label(frame_ev, text="ID Événement :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#181818").pack(anchor="w")
+        self.entry_event_id = tk.Entry(frame_ev, font=("Segoe UI", 9), bg="#262626", fg="#FFFFFF", insertbackground="white")
         self.entry_event_id.insert(0, "CONCERT-2026")
         self.entry_event_id.pack(fill="x", pady=2)
 
-        frame_cat = tk.Frame(row_event, bg="#1E1E1E")
-        frame_cat.pack(side="left", fill="x", expand=True, padx=(5, 0))
-        tk.Label(frame_cat, text="Catégories (ex: CARRE_OR, CAT_1) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#1E1E1E").pack(anchor="w")
-        self.entry_cat = tk.Entry(frame_cat, font=("Segoe UI", 9), bg="#2A2A2A", fg="#FFFFFF", insertbackground="white")
+        frame_cat = tk.Frame(row_event, bg="#181818")
+        frame_cat.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        tk.Label(frame_cat, text="Catégories (ex: CARRE_OR, CAT_1) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#181818").pack(anchor="w")
+        self.entry_cat = tk.Entry(frame_cat, font=("Segoe UI", 9), bg="#262626", fg="#FFFFFF", insertbackground="white")
         self.entry_cat.insert(0, "CARRE_OR, CAT_1")
         self.entry_cat.pack(fill="x", pady=2)
 
-        # Quantité & Lead Time (ms)
-        row_qty_lead = tk.Frame(form_frame, bg="#1E1E1E")
-        row_qty_lead.pack(fill="x", pady=(0, 6))
+        # Quantité & Lead Time
+        row_qty_lead = tk.Frame(form_frame, bg="#181818")
+        row_qty_lead.pack(fill="x", pady=(0, 5))
 
-        frame_qty = tk.Frame(row_qty_lead, bg="#1E1E1E")
-        frame_qty.pack(side="left", fill="x", expand=True, padx=(0, 5))
-        tk.Label(frame_qty, text="Nombre de Billets :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#1E1E1E").pack(anchor="w")
+        frame_qty = tk.Frame(row_qty_lead, bg="#181818")
+        frame_qty.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        tk.Label(frame_qty, text="Nombre de Billets :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#181818").pack(anchor="w")
         self.combo_qty = ttk.Combobox(frame_qty, values=["1", "2", "3", "4"], width=6, state="readonly")
         self.combo_qty.set("2")
         self.combo_qty.pack(anchor="w", pady=2)
 
-        frame_lead = tk.Frame(row_qty_lead, bg="#1E1E1E")
-        frame_lead.pack(side="left", fill="x", expand=True, padx=(5, 0))
-        tk.Label(frame_lead, text="Avance Firing (Lead Time ms) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#1E1E1E").pack(anchor="w")
-        self.entry_lead = tk.Entry(frame_lead, font=("Segoe UI", 9), bg="#2A2A2A", fg="#FFFFFF", insertbackground="white", width=10)
+        frame_lead = tk.Frame(row_qty_lead, bg="#181818")
+        frame_lead.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        tk.Label(frame_lead, text="Avance Firing (Lead Time ms) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#181818").pack(anchor="w")
+        self.entry_lead = tk.Entry(frame_lead, font=("Segoe UI", 9), bg="#262626", fg="#FFFFFF", insertbackground="white", width=10)
         self.entry_lead.insert(0, "35.0")
         self.entry_lead.pack(anchor="w", pady=2)
 
-        # Session Auth / Cookie (Optionnel)
-        row_auth = tk.Frame(form_frame, bg="#1E1E1E")
-        row_auth.pack(fill="x", pady=(0, 2))
+        # Session Auth / Cookie
+        row_auth = tk.Frame(form_frame, bg="#181818")
+        row_auth.pack(fill="x", pady=(0, 5))
 
-        frame_ck = tk.Frame(row_auth, bg="#1E1E1E")
-        frame_ck.pack(side="left", fill="x", expand=True, padx=(0, 5))
-        tk.Label(frame_ck, text="Session Cookie (Compte) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#1E1E1E").pack(anchor="w")
-        self.entry_cookie = tk.Entry(frame_ck, font=("Segoe UI", 8), bg="#2A2A2A", fg="#FFFFFF", insertbackground="white")
+        frame_ck = tk.Frame(row_auth, bg="#181818")
+        frame_ck.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        tk.Label(frame_ck, text="Session Cookie / Token :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#181818").pack(anchor="w")
+        self.entry_cookie = tk.Entry(frame_ck, font=("Segoe UI", 8), bg="#262626", fg="#FFFFFF", insertbackground="white")
         self.entry_cookie.insert(0, "")
         self.entry_cookie.pack(fill="x", pady=2)
 
-        frame_nt = tk.Frame(row_auth, bg="#1E1E1E")
-        frame_nt.pack(side="left", fill="x", expand=True, padx=(5, 0))
-        tk.Label(frame_nt, text="Alerte Mobile ntfy.sh (Optionnel) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#1E1E1E").pack(anchor="w")
-        self.entry_ntfy = tk.Entry(frame_nt, font=("Segoe UI", 8), bg="#2A2A2A", fg="#FFFFFF", insertbackground="white")
+        frame_nt = tk.Frame(row_auth, bg="#181818")
+        frame_nt.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        tk.Label(frame_nt, text="Alerte Mobile ntfy.sh (Optionnel) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#181818").pack(anchor="w")
+        self.entry_ntfy = tk.Entry(frame_nt, font=("Segoe UI", 8), bg="#262626", fg="#FFFFFF", insertbackground="white")
         self.entry_ntfy.insert(0, "")
         self.entry_ntfy.pack(fill="x", pady=2)
 
-        # Action Buttons Grid
-        btn_frame = tk.Frame(self.root, bg="#121212")
-        btn_frame.pack(fill="x", padx=10, pady=4)
+        # Action Buttons
+        btn_frame = tk.Frame(form_frame, bg="#181818", pady=6)
+        btn_frame.pack(fill="x")
 
-        row_btn1 = tk.Frame(btn_frame, bg="#121212")
+        row_btn1 = tk.Frame(btn_frame, bg="#181818")
         row_btn1.pack(fill="x", pady=2)
 
         self.btn_arm = tk.Button(
@@ -337,12 +436,11 @@ class BilletterieSniperApp:
             font=("Segoe UI", 9, "bold"),
             bg="#1976D2",
             fg="#FFFFFF",
-            activebackground="#1565C0",
             relief="flat",
             pady=6,
             command=self._on_arm,
         )
-        self.btn_arm.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.btn_arm.pack(side="left", fill="x", expand=True, padx=(0, 3))
 
         self.btn_fire = tk.Button(
             row_btn1,
@@ -350,14 +448,13 @@ class BilletterieSniperApp:
             font=("Segoe UI", 9, "bold"),
             bg="#00E676",
             fg="#000000",
-            activebackground="#00C853",
             relief="flat",
             pady=6,
             command=self._on_fire,
         )
-        self.btn_fire.pack(side="right", fill="x", expand=True, padx=(4, 0))
+        self.btn_fire.pack(side="right", fill="x", expand=True, padx=(3, 0))
 
-        row_btn2 = tk.Frame(btn_frame, bg="#121212")
+        row_btn2 = tk.Frame(btn_frame, bg="#181818")
         row_btn2.pack(fill="x", pady=4)
 
         self.btn_release = tk.Button(
@@ -366,12 +463,11 @@ class BilletterieSniperApp:
             font=("Segoe UI", 9),
             bg="#37474F",
             fg="#ECEFF1",
-            activebackground="#455A64",
             relief="flat",
             pady=5,
             command=self._on_release_snipe,
         )
-        self.btn_release.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.btn_release.pack(side="left", fill="x", expand=True, padx=(0, 3))
 
         self.btn_open_cart = tk.Button(
             row_btn2,
@@ -384,27 +480,86 @@ class BilletterieSniperApp:
             pady=5,
             command=self._on_open_cart,
         )
-        self.btn_open_cart.pack(side="right", fill="x", expand=True, padx=(4, 0))
+        self.btn_open_cart.pack(side="right", fill="x", expand=True, padx=(3, 0))
 
-        # Metrics & NTP Bar
-        metrics_frame = tk.Frame(self.root, bg="#1E1E1E", padx=12, pady=5)
-        metrics_frame.pack(fill="x", padx=10, pady=3)
+    def _build_tombola_tab(self):
+        frame = tk.Frame(self.tab_tombola, bg="#181818", padx=12, pady=8)
+        frame.pack(fill="both", expand=True)
 
-        tk.Label(metrics_frame, text="Offset Horloge NTP :", font=("Segoe UI", 8), fg="#78909C", bg="#1E1E1E").pack(side="left")
-        self.lbl_ntp = tk.Label(metrics_frame, text="N/A", font=("Segoe UI", 8, "bold"), fg="#FFD54F", bg="#1E1E1E")
-        self.lbl_ntp.pack(side="left", padx=(4, 15))
+        # Header Tombola Config
+        cfg_frame = tk.Frame(frame, bg="#212121", padx=10, pady=8)
+        cfg_frame.pack(fill="x", pady=(0, 6))
 
-        tk.Label(metrics_frame, text="Latence Réseau :", font=("Segoe UI", 8), fg="#78909C", bg="#1E1E1E").pack(side="left")
-        self.lbl_latency = tk.Label(metrics_frame, text="N/A", font=("Segoe UI", 8, "bold"), fg="#69F0AE", bg="#1E1E1E")
-        self.lbl_latency.pack(side="left", padx=4)
+        tk.Label(cfg_frame, text="Paramètres de Qualification Tombola :", font=("Segoe UI", 9, "bold"), fg="#81D4FA", bg="#212121").pack(anchor="w")
 
-        # Telemetry & Logs
-        log_frame = tk.Frame(self.root, bg="#1E1E1E", padx=10, pady=6)
-        log_frame.pack(fill="both", expand=True, padx=10, pady=(3, 10))
+        row_params = tk.Frame(cfg_frame, bg="#212121")
+        row_params.pack(fill="x", pady=(4, 0))
 
-        tk.Label(log_frame, text="Console de Télémétrie en Direct :", font=("Segoe UI", 8, "bold"), fg="#90A4AE", bg="#1E1E1E").pack(anchor="w")
-        self.text_log = tk.Text(log_frame, bg="#181818", fg="#ECEFF1", font=("Consolas", 8), relief="flat", height=7)
-        self.text_log.pack(fill="both", expand=True, pady=(3, 0))
+        tk.Label(row_params, text="Seuil d'Or (<=) :", font=("Segoe UI", 8), fg="#ECEFF1", bg="#212121").pack(side="left")
+        self.entry_golden = tk.Entry(row_params, font=("Segoe UI", 8), width=6, bg="#2E2E2E", fg="#FFFFFF", insertbackground="white")
+        self.entry_golden.insert(0, "500")
+        self.entry_golden.pack(side="left", padx=(3, 15))
+
+        tk.Label(row_params, text="Min Secours :", font=("Segoe UI", 8), fg="#ECEFF1", bg="#212121").pack(side="left")
+        self.entry_min_keep = tk.Entry(row_params, font=("Segoe UI", 8), width=5, bg="#2E2E2E", fg="#FFFFFF", insertbackground="white")
+        self.entry_min_keep.insert(0, "2")
+        self.entry_min_keep.pack(side="left", padx=(3, 15))
+
+        tk.Label(row_params, text="Plafond Max :", font=("Segoe UI", 8), fg="#ECEFF1", bg="#212121").pack(side="left")
+        self.entry_max_keep = tk.Entry(row_params, font=("Segoe UI", 8), width=5, bg="#2E2E2E", fg="#FFFFFF", insertbackground="white")
+        self.entry_max_keep.insert(0, "5")
+        self.entry_max_keep.pack(side="left", padx=(3, 0))
+
+        # Launch Button
+        self.btn_run_tombola = tk.Button(
+            frame,
+            text="🎰 LANCER LE TIRAGE TOMBOLA (20 IPs SIMULTANÉES)",
+            font=("Segoe UI", 9, "bold"),
+            bg="#FFB300",
+            fg="#000000",
+            relief="flat",
+            pady=7,
+            command=self._on_run_tombola,
+        )
+        self.btn_run_tombola.pack(fill="x", pady=4)
+
+        # Leaderboard Treeview
+        tree_frame = tk.Frame(frame, bg="#181818")
+        tree_frame.pack(fill="both", expand=True, pady=4)
+
+        columns = ("rank", "ip", "queue_num", "status", "decision")
+        self.tree_tombola = ttk.Treeview(tree_frame, columns=columns, show="headings", height=8)
+        self.tree_tombola.heading("rank", text="Rang")
+        self.tree_tombola.heading("ip", text="Adresse IP / Proxy")
+        self.tree_tombola.heading("queue_num", text="Position File")
+        self.tree_tombola.heading("status", text="Statut")
+        self.tree_tombola.heading("decision", text="Action Moteur")
+
+        self.tree_tombola.column("rank", width=45, anchor="center")
+        self.tree_tombola.column("ip", width=130, anchor="center")
+        self.tree_tombola.column("queue_num", width=95, anchor="e")
+        self.tree_tombola.column("status", width=85, anchor="center")
+        self.tree_tombola.column("decision", width=180, anchor="w")
+
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree_tombola.yview)
+        self.tree_tombola.configure(yscrollcommand=scroll.set)
+
+        self.tree_tombola.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        # Action: Apply best IP to Tab 1
+        self.btn_apply_best = tk.Button(
+            frame,
+            text="✨ Injecter la Meilleure Session Gagnante dans le Sniper",
+            font=("Segoe UI", 8, "bold"),
+            bg="#2E7D32",
+            fg="#FFFFFF",
+            relief="flat",
+            pady=5,
+            state="disabled",
+            command=self._on_apply_best_ip,
+        )
+        self.btn_apply_best.pack(fill="x", pady=(3, 0))
 
     def log(self, message: str):
         timestamp = time.strftime("%H:%M:%S")
@@ -443,6 +598,30 @@ class BilletterieSniperApp:
         if self.checkout_url:
             webbrowser.open(self.checkout_url)
 
+    def _on_run_tombola(self):
+        sample_20 = [f"192.168.10.{i}" for i in range(1, 21)]
+        golden = int(self.entry_golden.get().strip() or "500")
+        min_k = int(self.entry_min_keep.get().strip() or "2")
+        max_k = int(self.entry_max_keep.get().strip() or "5")
+
+        self.btn_run_tombola.configure(state="disabled", text="TIR EN COURS SUR 20 IPs...")
+        self.worker.run_coro(
+            self.worker.run_lottery_survey(
+                ip_list=sample_20,
+                golden_threshold=golden,
+                min_keep=min_k,
+                max_keep=max_k,
+            )
+        )
+
+    def _on_apply_best_ip(self):
+        best = self.worker.lottery_selector.best_ticket()
+        if best:
+            self.entry_cookie.delete(0, "end")
+            self.entry_cookie.insert(0, f"session_{best.ip_address.replace('.', '_')}")
+            self.notebook.select(self.tab_sniper)
+            self.log(f"[TOMBOLA] Session IP {best.ip_address} (#{best.queue_number}) transférée vers le Sniper !")
+
     def _poll_queue(self):
         try:
             while True:
@@ -464,6 +643,32 @@ class BilletterieSniperApp:
                             bg="#00E676",
                             fg="#000000",
                         )
+                elif msg_type == "lottery_results":
+                    all_sorted, kept, discarded, elapsed_ms = data
+                    self.btn_run_tombola.configure(state="normal", text="🎰 LANCER LE TIRAGE TOMBOLA (20 IPs SIMULTANÉES)")
+
+                    # Clear existing items
+                    for item in self.tree_tombola.get_children():
+                        self.tree_tombola.delete(item)
+
+                    for idx, ticket in enumerate(all_sorted, start=1):
+                        pos = ticket.queue_number
+                        if ticket.status == "selected":
+                            stat = "GOLDEN" if pos <= 500 else "SELECTED"
+                            act = "Session conservée"
+                        else:
+                            stat = "PRUNED"
+                            act = "Socket coupée"
+
+                        self.tree_tombola.insert(
+                            "",
+                            "end",
+                            values=(f"#{idx}", ticket.ip_address, f"#{pos:,}", stat, act),
+                        )
+
+                    self.btn_apply_best.configure(state="normal")
+                    self.log(f"[TOMBOLA] Tableau mis à jour : {len(kept)} retenues, {len(discarded)} coupées en {elapsed_ms:.1f} ms.")
+
         except queue.Empty:
             pass
         finally:

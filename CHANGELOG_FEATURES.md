@@ -43,3 +43,13 @@
 - Correction de la détection d'instance vide dans `MultiIpLotteryOrchestrator` via `__bool__` et garde explicite `is not None`.
 **Attention**:
 - Vérifier que les 20 proxies sont configurés en sessions persistantes ("sticky") pour éviter tout changement d'IP durant l'attente dans la file.
+
+## [2026-10-01] GUI_MULTI_IP_TOMBOLA
+**Fichiers**: `gui/app.py`
+**Raison**: Intégration graphique de la gestion de tombola 20 IP dans l'interface Tkinter pour contrôle visuel et transfert direct vers le sniper.
+**Logique**:
+- Ajout d'une structure à onglets `ttk.Notebook` isolant le tir T0 et la tombola multi-IP.
+- Tableau interactif `ttk.Treeview` affichant en temps réel le classement des 20 IP, les tickets d'or (<= 500), et les sessions élaguées.
+- Bouton de transfert en 1 clic injectant la session de l'IP gagnante dans l'onglet de réservation.
+**Attention**:
+- Le thread UI reste strictement isolé du thread worker asynchrone pour ne pas altérer la précision temporelle à l'ouverture.
