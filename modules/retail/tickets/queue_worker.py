@@ -63,6 +63,8 @@ class QueueWorkerConfig:
     poll_interval_sec: float = 1.0
     timeout_sec: float = 3600.0
     chrome_binary_path: Optional[str] = None
+    enable_keepalive: bool = True
+    keepalive_interval_sec: float = 15.0
 
 
 # [FEATURE: HEADLESS_QUEUE_WORKER] Real browser queue listener with microsecond API handoff
@@ -81,6 +83,7 @@ class HeadlessQueueWorker:
         self._browser = None
         self._context = None
         self._page = None
+        self._keepalive_task = None
         self.is_running = False
         self.is_admitted = False
         self.handoff_data: Optional[AdmissionHandoff] = None
@@ -157,6 +160,49 @@ class HeadlessQueueWorker:
             wait_until="domcontentloaded",
             timeout=30000,
         )
+        if self.config.enable_keepalive and self._keepalive_task is None:
+            self._keepalive_task = asyncio.create_task(self._natural_keepalive_loop())
+
+    async def _natural_keepalive_loop(self) -> None:
+        """
+        Sends periodic subtle mouse movements and scroll events while waiting in queue.
+        Prevents Chromium from throttling background tabs and maintaining session liveliness.
+        """
+        import random
+        while self.is_running and not self.is_admitted:
+            try:
+                await asyncio.sleep(self.config.keepalive_interval_sec)
+                if self._page and not self._page.is_closed():
+                    await self._page.mouse.move(random.randint(150, 450), random.randint(150, 450))
+            except asyncio.CancelledError:
+                break
+            except Exception as keepalive_err:
+                logger.debug("Keepalive subtle pulse ignored: %s", keepalive_err)
+
+    async def check_interactive_challenge(self) -> bool:
+        """
+        Detects if an interactive CAPTCHA, Cloudflare Turnstile, or human verification
+        challenge is actively visible in the DOM.
+        """
+        if not self._page or self._page.is_closed():
+            return False
+
+        challenge_selectors = [
+            "iframe[src*='challenges.cloudflare.com']",
+            "iframe[src*='recaptcha']",
+            "iframe[src*='hcaptcha']",
+            "iframe[src*='arkoselabs']",
+            "#turnstile-wrapper",
+            ".g-recaptcha",
+        ]
+        for selector in challenge_selectors:
+            try:
+                is_present = await self._page.locator(selector).first.is_visible(timeout=100)
+                if is_present:
+                    return True
+            except Exception:
+                continue
+        return False
 
     async def extract_current_cookies(self) -> Dict[str, str]:
         """Reads current cookie state from the browser context."""
@@ -295,6 +341,8 @@ class HeadlessQueueWorker:
     async def close(self) -> None:
         """Closes browser context and Playwright process cleanly."""
         try:
+            if self._keepalive_task and not self._keepalive_task.done():
+                self._keepalive_task.cancel()
             if self._context:
                 await self._context.close()
             if self._browser:

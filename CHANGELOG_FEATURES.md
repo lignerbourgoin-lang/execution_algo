@@ -74,3 +74,13 @@
 - Préserve 100% de la signature de pile réseau (chiffrement BoringSSL, en-têtes HTTP/2 natifs, cookies de session automatiques).
 **Attention**:
 - Nécessite que le worker de file soit démarré et que la page soit active.
+
+## [2026-10-01] BROWSER_WORKER_EXECUTOR_INTEGRATION
+**Fichiers**: `modules/retail/tickets/ticket_engine.py`, `modules/retail/tickets/queue_worker.py`
+**Raison**: Intégration complète du worker de file d'attente Chromium dans le moteur d'exécution `TicketDropExecutor` pour un tir natif in-browser et maintien de session actif.
+**Logique**:
+- `TicketDropExecutor` accepte désormais une instance `browser_worker`. Si présente, la réservation est injectée directement via `execute_in_browser_fetch()` dans le navigateur Chrome sans passer par `httpx` / OpenSSL.
+- `HeadlessQueueWorker` inclut un pulse d'activité naturelle périodique (`_natural_keepalive_loop`) évitant le gel d'onglet en arrière-plan et maintenant la réputation de session.
+- Détection proactive des challenges interactifs (`check_interactive_challenge`) pour les formulaires de vérification humaine.
+**Attention**:
+- Si `browser_worker` n'est pas fourni ou inactif, le moteur bascule automatiquement sur le transport haute performance `PrewarmedHttpClient`.

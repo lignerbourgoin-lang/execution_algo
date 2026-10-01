@@ -72,12 +72,14 @@ class TicketDropExecutor(BaseExecutor):
         http_client: PrewarmedHttpClient,
         ntp_client: Optional[NtpClient] = None,
         telemetry: Optional[LatencyTracker] = None,
+        browser_worker: Optional[Any] = None,
     ):
         self.config = config
         self.client = http_client
         self.ntp = ntp_client or NtpClient()
         self.scheduler = HighPrecisionScheduler(self.ntp)
         self.telemetry = telemetry or LatencyTracker()
+        self.browser_worker = browser_worker
         self.is_armed = False
         self.active_cart: Optional[CartReservation] = None
         self._prebuilt_requests: Dict[str, httpx.Request] = {}
@@ -313,7 +315,26 @@ class TicketDropExecutor(BaseExecutor):
         )
 
         prebuilt = self._prebuilt_requests.get(category)
-        if prebuilt is not None:
+        if self.browser_worker and getattr(self.browser_worker, "is_running", False):
+            endpoint = payload.get("reserve_endpoint", f"/api/events/{self.config.event_id}/reserve")
+            reservation_body = {
+                "event_id": self.config.event_id,
+                "category_id": category,
+                "quantity": self.config.quantity,
+            }
+            target_url = f"{self.config.target_url.rstrip('/')}{endpoint}"
+            raw_res = await self.browser_worker.execute_in_browser_fetch(
+                endpoint_url=target_url,
+                method="POST",
+                payload=reservation_body,
+                custom_headers=self._prepare_headers(),
+            )
+            res = {
+                "status_code": raw_res.get("status_code", 0),
+                "body": raw_res.get("data", {}),
+                "error": raw_res.get("error"),
+            }
+        elif prebuilt is not None:
             res = await self.client.send_fast(request=prebuilt, action_id=action_id)
         else:
             headers = self._prepare_headers()
