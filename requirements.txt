@@ -1,0 +1,4 @@
+httpx[http2]>=0.27.0
+h2>=4.1.0
+websockets>=13.0
+rich>=13.0.0

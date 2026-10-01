@@ -9,15 +9,19 @@ Validates:
 """
 
 import asyncio
+import json
 import sys
 import os
 import unittest
+import httpx
 
 # Ensure execution_algo is in path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from core.engine.base import BaseExecutor, BaseStrategy, ExecutionResult, Signal
 from core.engine.orchestrator import ExecutionOrchestrator
+from core.network.persistent_client import PersistentHttpClient
+from core.network.ws_client import WebSocketClient
 from core.rate_limiter.limiter import AdaptiveRateLimiter, TokenBucketLimiter
 from core.telemetry.tracker import LatencyTracker
 
@@ -149,6 +153,92 @@ class TestExecutionOrchestrator(unittest.IsolatedAsyncioTestCase):
 
         await orchestrator.shutdown()
         self.assertFalse(executor.initialized)
+
+    async def test_bounded_execution_history(self):
+        orchestrator = ExecutionOrchestrator()
+        # Append 1050 mock results directly to execution_history
+        for i in range(1050):
+            orchestrator.execution_history.append(
+                ExecutionResult(
+                    action_id=f"act_{i}",
+                    success=True,
+                    status_code=200,
+                    data={},
+                    latency_ms=1.0,
+                )
+            )
+        # History must not exceed maxlen (1000)
+        self.assertEqual(len(orchestrator.execution_history), 1000)
+        # The oldest elements should have been dropped
+        self.assertEqual(orchestrator.execution_history[0].action_id, "act_50")
+        self.assertEqual(orchestrator.execution_history[-1].action_id, "act_1049")
+
+
+class TestPersistentHttpClient(unittest.IsolatedAsyncioTestCase):
+    async def test_idempotency_key_and_content_headers(self):
+        recorded_requests = []
+
+        def mock_handler(request: httpx.Request):
+            recorded_requests.append(request)
+            return httpx.Response(200, json={"status": "confirmed"})
+
+        transport = httpx.MockTransport(mock_handler)
+        mock_client = httpx.AsyncClient(transport=transport, base_url="https://api.test.com")
+
+        client = PersistentHttpClient(
+            base_url="https://api.test.com",
+            client=mock_client,
+        )
+
+        res = await client.execute_fast(
+            method="POST",
+            endpoint="/orders",
+            action_id="act_idem_1",
+            json_data={"symbol": "BTCUSDT", "qty": 0.5},
+            idempotency_key="unique-idempotency-key-12345",
+        )
+
+        self.assertEqual(res["status_code"], 200)
+        self.assertEqual(len(recorded_requests), 1)
+        req = recorded_requests[0]
+        self.assertEqual(req.headers.get("Idempotency-Key"), "unique-idempotency-key-12345")
+        self.assertIn("application/json", req.headers.get("content-type", ""))
+        body = json.loads(req.content.decode("utf-8"))
+        self.assertEqual(body["symbol"], "BTCUSDT")
+
+        await client.close()
+
+
+class TestWebSocketClientGapDetection(unittest.IsolatedAsyncioTestCase):
+    async def test_sequence_gap_detection(self):
+        ws_client = WebSocketClient("wss://stream.binance.com:9443/ws/test")
+        detected_gaps = []
+
+        async def on_gap(last_seq, new_seq):
+            detected_gaps.append((last_seq, new_seq))
+
+        ws_client.on_sequence_gap(on_gap)
+
+        # 1. First event: seq 100
+        ws_client._dispatch_message(json.dumps({"u": 100, "price": "60000"}), 1000)
+        await asyncio.sleep(0.01)
+        self.assertEqual(ws_client.last_sequence_id, 100)
+        self.assertEqual(ws_client.gaps_detected, 0)
+        self.assertEqual(len(detected_gaps), 0)
+
+        # 2. Second event: seq 101 (contiguous -> no gap)
+        ws_client._dispatch_message(json.dumps({"u": 101, "price": "60010"}), 2000)
+        await asyncio.sleep(0.01)
+        self.assertEqual(ws_client.last_sequence_id, 101)
+        self.assertEqual(ws_client.gaps_detected, 0)
+
+        # 3. Third event: seq 105 (gap of 3 events: 102, 103, 104)
+        ws_client._dispatch_message(json.dumps({"u": 105, "price": "60050"}), 3000)
+        await asyncio.sleep(0.02)
+        self.assertEqual(ws_client.last_sequence_id, 105)
+        self.assertEqual(ws_client.gaps_detected, 1)
+        self.assertEqual(len(detected_gaps), 1)
+        self.assertEqual(detected_gaps[0], (101, 105))
 
 
 if __name__ == "__main__":

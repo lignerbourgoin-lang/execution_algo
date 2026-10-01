@@ -1,12 +1,12 @@
 {
   "task_name": "Lancement Drop / Billet Exemple",
   "target": {
-    "base_url": "https://api.binance.com",
-    "reserve_endpoint": "/api/v3/time",
-    "reserve_method": "GET",
-    "shipping_endpoint": "/api/v3/time",
-    "shipping_method": "GET",
-    "item_id": "TICKET-CONCERT-CAT1",
+    "base_url": "https://api.example.com",
+    "reserve_endpoint": "/api/v2/cart/add",
+    "reserve_method": "POST",
+    "shipping_endpoint": "/api/v2/checkout/shipping",
+    "shipping_method": "POST",
+    "item_id": "TICKET-EXAMPLE-CAT1",
     "quantity": 1
   },
   "scheduling": {
@@ -19,11 +19,11 @@
     "burst_capacity": 10.0
   },
   "customer_profile": {
-    "email": "utilisateur@domaine.com",
+    "email": "user@example.com",
     "shipping_address": {
-      "first_name": "Eliott",
-      "last_name": "Dupont",
-      "address1": "10 Rue de la Paix",
+      "first_name": "John",
+      "last_name": "Doe",
+      "address1": "123 Main St",
       "city": "Paris",
       "zip": "75001",
       "country": "FR"

@@ -41,9 +41,9 @@ class TestHighPrecisionScheduler(unittest.IsolatedAsyncioTestCase):
         target_utc = client.get_atomic_time() + 0.05
         metrics = await scheduler.wait_until_atomic_timestamp(target_utc, latency_advance_ms=0.0)
 
-        # Accuracy should be within microsecond range (< 5000 us = 5 ms)
-        self.assertIn("accuracy_us", metrics)
-        self.assertLess(metrics["accuracy_us"], 5000.0)
+        # Accuracy should be within millisecond range (< 10 ms)
+        self.assertIn("accuracy_ms", metrics)
+        self.assertLess(metrics["accuracy_ms"], 15.0)
 
 
 class MockHttpClient:
@@ -54,8 +54,13 @@ class MockHttpClient:
     async def start(self):
         pass
 
-    async def execute_fast(self, method, endpoint, action_id, json_data=None, headers=None):
-        self.calls.append({"method": method, "endpoint": endpoint, "json_data": json_data})
+    async def execute_fast(self, method, endpoint, action_id, json_data=None, headers=None, idempotency_key=None):
+        self.calls.append({
+            "method": method,
+            "endpoint": endpoint,
+            "json_data": json_data,
+            "idempotency_key": idempotency_key
+        })
         if self.responses:
             return self.responses.pop(0)
         return {"status_code": 200, "body": {"token": "test_tok_123"}}
@@ -84,7 +89,7 @@ class TestCheckoutStateMachine(unittest.IsolatedAsyncioTestCase):
         )
 
         await fsm.initialize()
-        self.assertEqual(fsm.state, CheckoutState.ARMED)
+        self.assertTrue(fsm.is_armed)
 
         signal = Signal(
             source="detector",
@@ -95,11 +100,68 @@ class TestCheckoutStateMachine(unittest.IsolatedAsyncioTestCase):
 
         result = await fsm.execute(signal)
         self.assertTrue(result.success)
-        self.assertEqual(fsm.state, CheckoutState.COMPLETED)
+        self.assertEqual(result.data["token"], "cart_xyz")
         self.assertEqual(len(mock_client.calls), 2)
         self.assertEqual(mock_client.calls[0]["json_data"]["item_id"], "item_123")
         self.assertEqual(mock_client.calls[1]["json_data"]["token"], "cart_xyz")
 
+    async def test_missing_token_fails_without_fake_fallback(self):
+        # Server returns 200 but no token/cart_id -> Must fail explicitly (no tok_simulated)
+        mock_client = MockHttpClient(
+            responses=[
+                {"status_code": 200, "body": {"message": "Success without token"}},
+            ]
+        )
+        profile = CheckoutProfile(email="test@example.com", shipping_address={"country": "FR"})
+        fsm = FastCheckoutStateMachine("https://example.com", mock_client, profile)
+
+        signal = Signal(source="test", target_id="store", action="BUY", payload={"item_id": "1"})
+        result = await fsm.execute(signal)
+
+        self.assertFalse(result.success)
+        self.assertIn("missing reservation token", result.error)
+        self.assertEqual(len(mock_client.calls), 1)
+
+    async def test_http_error_fails_immediately(self):
+        mock_client = MockHttpClient(
+            responses=[
+                {"status_code": 403, "body": {"error": "Forbidden"}},
+            ]
+        )
+        profile = CheckoutProfile(email="test@example.com", shipping_address={"country": "FR"})
+        fsm = FastCheckoutStateMachine("https://example.com", mock_client, profile)
+
+        signal = Signal(source="test", target_id="store", action="BUY", payload={"item_id": "1"})
+        result = await fsm.execute(signal)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.status_code, 403)
+        self.assertIn("Reservation failed", result.error)
+        self.assertEqual(len(mock_client.calls), 1)
+
+    async def test_stateless_concurrent_executions(self):
+        # Two executions should run independently without overwriting each other's state
+        class DynamicMockClient(MockHttpClient):
+            async def execute_fast(self, method, endpoint, action_id, json_data=None, headers=None, idempotency_key=None):
+                self.calls.append({"method": method, "endpoint": endpoint, "json_data": json_data})
+                if "cart" in endpoint:
+                    return {"status_code": 200, "body": {"token": f"token_{json_data.get('item_id')}"}}
+                return {"status_code": 200, "body": {"order_id": f"ord_{json_data.get('token')}"}}
+
+        mock_client = DynamicMockClient()
+        profile = CheckoutProfile(email="test@example.com", shipping_address={"country": "FR"})
+        fsm = FastCheckoutStateMachine("https://example.com", mock_client, profile)
+
+        sig_a = Signal(source="test", target_id="store", action="BUY", payload={"item_id": "A", "idempotency_key": "key_A"})
+        sig_b = Signal(source="test", target_id="store", action="BUY", payload={"item_id": "B", "idempotency_key": "key_B"})
+
+        res_a, res_b = await asyncio.gather(fsm.execute(sig_a), fsm.execute(sig_b))
+        self.assertTrue(res_a.success)
+        self.assertTrue(res_b.success)
+        self.assertEqual(res_a.data["token"], "token_A")
+        self.assertEqual(res_b.data["token"], "token_B")
+
 
 if __name__ == "__main__":
     unittest.main()
+

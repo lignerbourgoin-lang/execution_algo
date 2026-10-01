@@ -6,9 +6,10 @@ Dispatches signals asynchronously with zero blocking overhead.
 """
 
 import asyncio
+import collections
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from core.engine.base import BaseExecutor, BaseStrategy, ExecutionResult, Signal
 from core.telemetry.tracker import LatencyTracker
@@ -20,13 +21,16 @@ class ExecutionOrchestrator:
     """
     Central dispatcher coordinating:
     - Data ingress -> Strategy evaluation -> Immediate Executor dispatch.
+    - Strong task reference tracking (prevents GC drop and unhandled exceptions).
+    - Bounded execution history (prevents unbounded memory growth).
     """
 
-    def __init__(self, telemetry: Optional[LatencyTracker] = None):
+    def __init__(self, telemetry: Optional[LatencyTracker] = None, max_history: int = 1000):
         self.telemetry = telemetry or LatencyTracker()
         self.strategies: List[BaseStrategy] = []
         self.executors: Dict[str, BaseExecutor] = {}
-        self.execution_history: List[ExecutionResult] = []
+        self.execution_history = collections.deque(maxlen=max_history)
+        self._active_tasks: Set[asyncio.Task] = set()
         self._is_running = False
 
     def register_strategy(self, strategy: BaseStrategy):
@@ -53,8 +57,10 @@ class ExecutionOrchestrator:
             signal = strategy.evaluate(event_data)
             if signal:
                 signal.detected_at_ns = event_received_ns
-                # Non-blocking immediate execution dispatch
-                asyncio.create_task(self.dispatch_signal(signal))
+                # Keep strong task reference to prevent silent GC drop
+                task = asyncio.create_task(self.dispatch_signal(signal))
+                self._active_tasks.add(task)
+                task.add_done_callback(self._active_tasks.discard)
 
     async def dispatch_signal(self, signal: Signal) -> Optional[ExecutionResult]:
         """Routes signal to the dedicated executor."""
@@ -69,7 +75,10 @@ class ExecutionOrchestrator:
         return result
 
     async def shutdown(self):
-        """Gracefully shuts down all executors."""
+        """Gracefully shuts down all executors and awaits remaining active tasks."""
         self._is_running = False
+        if self._active_tasks:
+            await asyncio.gather(*self._active_tasks, return_exceptions=True)
+            self._active_tasks.clear()
         for executor in self.executors.values():
             await executor.shutdown()

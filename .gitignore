@@ -45,3 +45,9 @@ Thumbs.db
 *.log
 benchmarks/reports/
 reports/
+
+# Configuration files with secrets / personal data
+config/*.json
+!config/targets.json
+!config/*.example
+!config/*.json.example

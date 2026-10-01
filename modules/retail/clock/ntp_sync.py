@@ -102,18 +102,7 @@ class NtpClient:
         finally:
             client.close()
 
-    def sync(self, servers: Optional[List[str]] = None) -> Dict[str, Any]:
-        """
-        Queries all servers, filters valid responses, and calculates median clock offset.
-        """
-        servers = servers or self.DEFAULT_SERVERS
-        results: List[NtpSyncResult] = []
-
-        for s in servers:
-            res = self.query_server(s)
-            if res:
-                results.append(res)
-
+    def _process_results(self, results: List[NtpSyncResult]) -> Dict[str, Any]:
         if not results:
             return {
                 "success": False,
@@ -147,6 +136,27 @@ class NtpClient:
             ],
         }
 
+    def sync(self, servers: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Synchronous query of all NTP servers."""
+        servers = servers or self.DEFAULT_SERVERS
+        results: List[NtpSyncResult] = []
+        for s in servers:
+            res = self.query_server(s)
+            if res:
+                results.append(res)
+        return self._process_results(results)
+
+    async def sync_async(self, servers: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Asynchronously queries all NTP servers in parallel using worker threads,
+        completely non-blocking for the asyncio event loop.
+        """
+        servers = servers or self.DEFAULT_SERVERS
+        tasks = [asyncio.to_thread(self.query_server, s) for s in servers]
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = [r for r in raw_results if isinstance(r, NtpSyncResult)]
+        return self._process_results(results)
+
     def get_atomic_time(self) -> float:
         """Returns the current true UTC time (in seconds) adjusted for clock offset."""
         return time.time() + (self.cached_offset_ms / 1000.0)
@@ -155,8 +165,7 @@ class NtpClient:
 class HighPrecisionScheduler:
     """
     Schedules execution at exact atomic UTC timestamps.
-    Uses hybrid coarse sleep (asyncio.sleep) + fine spin-waiting (perf_counter_ns)
-    to achieve sub-millisecond dispatch accuracy.
+    Uses cooperative async sleep with boosted OS timer resolution to avoid CPU freezing.
     """
 
     def __init__(self, ntp_client: Optional[NtpClient] = None):
@@ -168,14 +177,14 @@ class HighPrecisionScheduler:
         latency_advance_ms: float = 0.0,
     ) -> Dict[str, float]:
         """
-        Waits until the exact target timestamp.
+        Waits until the exact target timestamp cooperatively without blocking the loop.
         :param target_atomic_timestamp_utc: True UTC timestamp when target event occurs.
         :param latency_advance_ms: Network lead time (e.g. RTT / 2) to fire before T0.
         :return: Metrics describing dispatch accuracy.
         """
-        # Ensure NTP sync is performed
+        # Ensure NTP sync is performed asynchronously
         if self.ntp.last_sync_time == 0.0:
-            self.ntp.sync()
+            await self.ntp.sync_async()
 
         # Boost Windows timer resolution from 15.6ms to 1ms
         is_win = (sys.platform == "win32")
@@ -194,28 +203,18 @@ class HighPrecisionScheduler:
             # Target timestamp on local system clock
             target_local_ns = target_atomic_ns - offset_ns - advance_ns
 
-            # 1. Coarse sleep phase (releases CPU loop until ~5ms before target)
+            # Cooperative sleep (does not block other asyncio tasks)
             now_local_ns = time.time_ns()
             remaining_ns = target_local_ns - now_local_ns
 
-            if remaining_ns > 12_000_000:  # > 12 ms
-                sleep_sec = (remaining_ns - 6_000_000) / 1_000_000_000.0
-                await asyncio.sleep(sleep_sec)
+            if remaining_ns > 0:
+                await asyncio.sleep(remaining_ns / 1_000_000_000.0)
 
-            # 2. Fine spin-wait phase using high-resolution perf_counter
-            t_ref_time_ns = time.time_ns()
-            t_ref_perf_ns = time.perf_counter_ns()
-            perf_target_ns = t_ref_perf_ns + (target_local_ns - t_ref_time_ns)
-
-            # Busy-wait until exact target nanosecond is reached
-            while time.perf_counter_ns() < perf_target_ns:
-                pass
-
-            fired_at_perf = time.perf_counter_ns()
-            accuracy_us = (fired_at_perf - perf_target_ns) / 1000.0  # Jitter in microseconds
+            fired_at_ns = time.time_ns()
+            accuracy_ms = (fired_at_ns - target_local_ns) / 1_000_000.0
 
             return {
-                "accuracy_us": round(accuracy_us, 2),
+                "accuracy_ms": round(accuracy_ms, 2),
                 "offset_applied_ms": round(self.ntp.cached_offset_ms, 3),
                 "lead_time_applied_ms": round(latency_advance_ms, 3),
             }

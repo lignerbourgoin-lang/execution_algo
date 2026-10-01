@@ -27,6 +27,7 @@ class PrewarmedHttpClient:
         rate_limiter: Optional[AdaptiveRateLimiter] = None,
         telemetry: Optional[LatencyTracker] = None,
         headers: Optional[Dict[str, str]] = None,
+        client: Optional[httpx.AsyncClient] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.heartbeat_interval_sec = heartbeat_interval_sec
@@ -41,14 +42,25 @@ class PrewarmedHttpClient:
         if headers:
             default_headers.update(headers)
 
-        limits = httpx.Limits(max_keepalive_connections=10, max_connections=20, keepalive_expiry=60.0)
-        self.client = httpx.AsyncClient(
-            base_url=self.base_url,
-            limits=limits,
-            headers=default_headers,
-            timeout=10.0,
-            verify=True,
-        )
+        if client is not None:
+            self.client = client
+        else:
+            # Check HTTP/2 support (h2 package)
+            try:
+                import h2  # noqa: F401
+                has_h2 = True
+            except ImportError:
+                has_h2 = False
+
+            limits = httpx.Limits(max_keepalive_connections=10, max_connections=20, keepalive_expiry=60.0)
+            self.client = httpx.AsyncClient(
+                base_url=self.base_url,
+                http2=has_h2,
+                limits=limits,
+                headers=default_headers,
+                timeout=10.0,
+                verify=True,
+            )
 
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._is_running = False
@@ -93,10 +105,12 @@ class PrewarmedHttpClient:
         json_data: Optional[Dict[str, Any]] = None,
         content: Optional[bytes] = None,
         headers: Optional[Dict[str, str]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes a priority action on the pre-warmed connection with microsecond tracking.
         Supports both json_data and pre-serialized raw bytes.
+        Supports standard Idempotency-Key header to prevent duplicate execution upon retries.
         """
         trace = self.telemetry.start_trace(action_id=action_id, target=f"{self.base_url}{endpoint}")
 
@@ -109,6 +123,9 @@ class PrewarmedHttpClient:
         try:
             req_kwargs = {}
             req_headers = dict(headers) if headers else {}
+
+            if idempotency_key:
+                req_headers["Idempotency-Key"] = idempotency_key
 
             if content is not None:
                 req_kwargs["content"] = content
@@ -166,3 +183,8 @@ class PrewarmedHttpClient:
             except asyncio.CancelledError:
                 pass
         await self.client.aclose()
+
+
+# Alias for intuitive naming
+PersistentHttpClient = PrewarmedHttpClient
+
