@@ -1,0 +1,38 @@
+defaults:
+  poll_seconds: [2.0, 4.0]
+  burst:
+    shots: 5
+    spacing_ms: 80
+  admit_timeout_s: 7200
+
+events:
+  - id: example_drop
+    type: drop
+    adapter: generic_json
+    t0: "2026-06-01T10:00:00+02:00"
+    account_cap: 6
+    categories: ["GOLD", "CAT1"]
+    max_price: null
+    urls:
+      ping: "https://example.invalid/ping"
+      stock: "https://example.invalid/stock"
+      hold: "https://example.invalid/hold"
+      admitted: "https://example.invalid/admitted"
+    session:
+      headers: {}
+      cookies: {}
+
+  - id: example_resale
+    type: resale
+    adapter: generic_json
+    account_cap: 4
+    max_price: 200
+    categories: ["CAT1"]
+    urls:
+      ping: "https://example.invalid/ping"
+      stock: "https://example.invalid/stock"
+      hold: "https://example.invalid/hold"
+      admitted: "https://example.invalid/admitted"
+    session:
+      headers: {}
+      cookies: {}

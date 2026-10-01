@@ -1,0 +1,9 @@
+quantity: 5
+attendees:
+  - name: "A"
+  - name: "B"
+  - name: "C"
+  - name: "D"
+  - name: "E"
+notify:
+  webhook: ""
