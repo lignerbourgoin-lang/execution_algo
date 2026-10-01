@@ -18,6 +18,11 @@ from modules.retail.tickets.queue_worker import (
     QueueWorkerConfig,
     find_chrome_executable,
 )
+from modules.retail.tickets.staggered_executor import (
+    StaggerConfig,
+    StaggeredDropOrchestrator,
+    StaggeredDropResult,
+)
 from modules.retail.tickets.ticket_engine import (
     CartReservation,
     TicketConfig,
@@ -35,4 +40,7 @@ __all__ = [
     "QueueWorkerConfig",
     "AdmissionHandoff",
     "find_chrome_executable",
+    "StaggerConfig",
+    "StaggeredDropOrchestrator",
+    "StaggeredDropResult",
 ]

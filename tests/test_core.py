@@ -110,6 +110,29 @@ class TestLatencyTracker(unittest.TestCase):
         self.assertEqual(summary["total_runs"], 1)
         self.assertEqual(summary["success_runs"], 1)
 
+    def test_export_audit_json(self):
+        import tempfile
+        tracker = LatencyTracker()
+        trace = tracker.start_trace(action_id="act_audit", target="https://example.com/api", tier=1)
+        trace.mark_stage("dns")
+        trace.complete(success=True)
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        out_path = tracker.export_audit_json(tmp_path)
+        self.assertEqual(out_path, tmp_path)
+
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.assertIn("summary", data)
+        self.assertIn("traces", data)
+        self.assertEqual(len(data["traces"]), 1)
+        self.assertEqual(data["traces"][0]["action_id"], "act_audit")
+        os.remove(tmp_path)
+
+
 
 class MockStrategy(BaseStrategy):
     def evaluate(self, market_data):

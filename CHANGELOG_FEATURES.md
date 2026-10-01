@@ -1,5 +1,17 @@
 # Changelog Features
 
+## [2026-10-01] STAGGERED_DROP_AND_CIRCUIT_BREAKER
+**Fichiers**: `core/network/circuit_breaker.py`, `core/network/waf_detector.py`, `core/telemetry/tracker.py`, `modules/retail/tickets/staggered_executor.py`, `tests/mock_drop_server.py`, `examples/demo_full_drop_simulation.py`
+**Raison**: Securisation des tirs multi-IP au T0 par echelonnement temporel (stagger), isolation proactive des proxies defaillants ou defies par WAF (circuit breaker), et serveur mock de simulation haute-fidelite.
+**Logique**:
+- **Circuit Breaker par IP (`IpCircuitBreakerPool`)** : Suivi fin de l'etat de chaque proxy (HEALTHY, THROTTLED, CHALLENGED, BURNED, HALF_OPEN). Mise en quarantaine automatique sur HTTP 403, 429 ou timeouts repetes, protegeant le pool au T0.
+- **Detecteur WAF passif et actif (`detect_waf_challenge`)** : Analyse fine des headers (cf-mitigated, cf-ray, x-datadome) et du body (Turnstile, Just a moment...) pour isoler les defis WAF et declencher un basculement navigateur si requis.
+- **Orchestrateur de tir echelonne (`StaggeredDropOrchestrator`)** : Repartition des IP en paliers temporels (ex: T0, T0+25ms, T0+50ms). Des qu'un palier decroche un panier, un evenement d'arret annule instantanement tous les autres tirs en vol, eliminant les doublons et respectant les quotas.
+- **Export d'audit nanoseconde (`export_audit_json`)** : Sauvegarde structuree de l'ensemble des metriques, breakdowns d'etapes et percentiles (p50, p95) pour analyse post-mortem.
+- **Serveur Mock realiste (`MockTicketingServer`)** : Simulation complete en memoire avec ouverture a T0, epuisement d'inventaire (409), liberation automatique des paniers expires pour wave sniping, et injection de challenges Cloudflare.
+**Attention**:
+- Les paliers d'echelonnement (stagger_interval_ms) doivent etre calibres entre 20 et 40 ms selon le nombre d'IP pour couvrir la fenetre d'ouverture sans saturer les limites de requetes par seconde.
+
 ## [2026-10-01] ENGINE_PERF_OPTIMIZATIONS
 **Fichiers**: `core/rate_limiter/limiter.py`, `core/network/persistent_client.py`, `modules/retail/tickets/ticket_engine.py`, `tests/test_core.py`, `tests/test_ticketing.py`, `tests/test_tickets.py`
 **Raison**: Optimisation du chemin critique de tirage et de surveillance des paniers expires (wave sniping) pour eliminer les doubles reveils asyncio, la derive temporelle de polling et la surcharge systeme au T0.

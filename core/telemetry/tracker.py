@@ -62,6 +62,21 @@ class ExecutionTrace:
         breakdown["total_ms"] = round(self.total_latency_ms, 3)
         return breakdown
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializes execution trace into a dictionary suitable for JSON serialization."""
+        return {
+            "action_id": self.action_id,
+            "target": self.target,
+            "started_at_ns": self.started_at_ns,
+            "completed_at_ns": self.completed_at_ns,
+            "total_latency_ms": round(self.total_latency_ms, 3),
+            "success": self.success,
+            "error": self.error,
+            "metadata": self.metadata,
+            "stages": [{"name": stage.name, "timestamp_ns": stage.timestamp_ns} for stage in self.stages],
+            "latency_breakdown": self.get_breakdown(),
+        }
+
 
 class LatencyTracker:
     """Aggregates and reports execution latency statistics across executions."""
@@ -77,7 +92,7 @@ class LatencyTracker:
     def get_summary(self) -> Dict[str, Any]:
         successful_traces = [t for t in self.traces if t.success]
         if not successful_traces:
-            return {"count": len(self.traces), "success_count": 0, "avg_latency_ms": 0.0}
+            return {"total_runs": len(self.traces), "success_runs": 0, "avg_ms": 0.0}
 
         latencies = [t.total_latency_ms for t in successful_traces]
         latencies.sort()
@@ -93,3 +108,25 @@ class LatencyTracker:
             "p95_ms": round(p95, 3),
             "avg_ms": round(sum(latencies) / len(latencies), 3),
         }
+
+    def export_audit_json(self, destination_path: str) -> str:
+        """
+        Exports all recorded traces and aggregated statistics to a formatted JSON audit file.
+        Creates parent directories if necessary.
+        """
+        import json
+        import os
+
+        parent_dir = os.path.dirname(os.path.abspath(destination_path))
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+
+        audit_payload = {
+            "summary": self.get_summary(),
+            "traces": [trace.to_dict() for trace in self.traces],
+        }
+        with open(destination_path, "w", encoding="utf-8") as json_file:
+            json.dump(audit_payload, json_file, indent=2)
+
+        return destination_path
+
