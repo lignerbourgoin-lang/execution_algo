@@ -80,6 +80,21 @@ class TestHeadlessQueueWorker(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             asyncio.run(run_failing_start())
 
+    def test_execute_in_browser_fetch_unstarted_error(self):
+        config = QueueWorkerConfig(
+            worker_id="test_fetch_worker",
+            target_queue_url="https://example.com",
+        )
+        worker = HeadlessQueueWorker(config)
+
+        import asyncio
+
+        async def run_unstarted_fetch():
+            await worker.execute_in_browser_fetch("https://example.com/api/reserve")
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(run_unstarted_fetch())
+
 
 if __name__ == "__main__":
     unittest.main()

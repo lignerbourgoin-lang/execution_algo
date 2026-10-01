@@ -64,3 +64,13 @@
 - Extraction immédiate des cookies et du User-Agent dans une structure typée `AdmissionHandoff` pour alimenter le moteur d'exécution en moins d'une milliseconde.
 **Attention**:
 - Chaque instance de worker doit tourner sur un contexte navigateur isolé et un proxy sticky dédié pour éviter l'invalidation de session.
+
+## [2026-10-01] IN_BROWSER_FETCH_EXECUTION
+**Fichiers**: `modules/retail/tickets/queue_worker.py`, `tests/test_queue_worker.py`
+**Raison**: Éliminer la discordance d'empreinte TLS / HTTP/2 (JA3/JA4) en déclenchant la réservation directement au sein du contexte de page Chrome admis.
+**Logique**:
+- Implémentation de `execute_in_browser_fetch()` dans `HeadlessQueueWorker`.
+- Exécute `window.fetch()` via `page.evaluate()` directement sur la socket et la session TLS du navigateur Chrome réel.
+- Préserve 100% de la signature de pile réseau (chiffrement BoringSSL, en-têtes HTTP/2 natifs, cookies de session automatiques).
+**Attention**:
+- Nécessite que le worker de file soit démarré et que la page soit active.

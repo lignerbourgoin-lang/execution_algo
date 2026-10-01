@@ -219,6 +219,79 @@ class HeadlessQueueWorker:
 
         raise TimeoutError(f"Worker [{self.config.worker_id}] admission timed out after {self.config.timeout_sec}s")
 
+    # [FEATURE: IN_BROWSER_FETCH_EXECUTION] Native in-browser reservation firing preserving 100% TLS/JA4 parity
+    # Raison: Dispatches the final cart reservation directly within the admitted Chrome instance via window.fetch
+    # Attention: Bypasses OpenSSL/Python fingerprint mismatch by reusing Chrome's genuine active TLS/HTTP2 session
+    async def execute_in_browser_fetch(
+        self,
+        endpoint_url: str,
+        method: str = "POST",
+        payload: Optional[Dict[str, Any]] = None,
+        custom_headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Executes an HTTP request directly within the admitted Chrome browser context
+        using window.fetch().
+
+        Guarantees 100% native TLS (JA3/JA4) and HTTP/2 settings frame parity
+        with the active Chrome session without any fingerprint divergence.
+        """
+        if not self._page:
+            raise RuntimeError("Browser page is not initialized. Call start() first.")
+
+        js_code = """
+        async ({ url, method, body, headers }) => {
+            const fetchOptions = {
+                method: method,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json, text/plain, */*',
+                    ...headers,
+                },
+                credentials: 'include',
+            };
+            if (body && method !== 'GET' && method !== 'HEAD') {
+                fetchOptions.body = JSON.stringify(body);
+            }
+            const startTime = performance.now();
+            try {
+                const response = await fetch(url, fetchOptions);
+                const durationMs = performance.now() - startTime;
+                let parsedData = null;
+                const contentType = response.headers.get('content-type') || '';
+                if (contentType.includes('application/json')) {
+                    parsedData = await response.json();
+                } else {
+                    parsedData = { text: await response.text() };
+                }
+                return {
+                    ok: response.ok,
+                    status_code: response.status,
+                    data: parsedData,
+                    duration_ms: durationMs,
+                    headers: Object.fromEntries(response.headers.entries()),
+                };
+            } catch (err) {
+                return {
+                    ok: false,
+                    status_code: 0,
+                    error: err.toString(),
+                    duration_ms: performance.now() - startTime,
+                };
+            }
+        }
+        """
+
+        args = {
+            "url": endpoint_url,
+            "method": method.upper(),
+            "body": payload,
+            "headers": custom_headers or {},
+        }
+
+        result = await self._page.evaluate(js_code, args)
+        return result
+
     async def close(self) -> None:
         """Closes browser context and Playwright process cleanly."""
         try:
