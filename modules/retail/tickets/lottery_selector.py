@@ -276,6 +276,9 @@ class LotteryQueueSelector:
         with self._lock:
             self._tickets.clear()
 
+    def __bool__(self) -> bool:
+        return True
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._tickets)
@@ -293,7 +296,7 @@ class MultiIpLotteryOrchestrator:
         concurrency_limit: int = 10,
         timeout_sec: float = 10.0,
     ) -> None:
-        self.selector = selector or LotteryQueueSelector()
+        self.selector = selector if selector is not None else LotteryQueueSelector()
         self.semaphore = asyncio.Semaphore(concurrency_limit)
         self.timeout_sec = timeout_sec
 

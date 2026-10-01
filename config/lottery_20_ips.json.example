@@ -1,0 +1,38 @@
+{
+  "task_name": "Multi-IP Lottery Queue Orchestrator (20 IPs)",
+  "queue_settings": {
+    "target_queue_url": "https://queue.example.com/api/queue/status",
+    "golden_threshold": 500,
+    "min_keep": 2,
+    "max_keep": 5,
+    "timeout_sec": 5.0,
+    "concurrency_limit": 20
+  },
+  "endpoints": {
+    "join_queue": "/api/queue/join",
+    "poll_status": "/api/queue/poll",
+    "admit_checkout": "/api/checkout/cart"
+  },
+  "instances": [
+    { "instance_id": "inst_01", "ip_or_proxy": "http://user:pass@proxy1.example.com:8080", "account_label": "Compte Principal" },
+    { "instance_id": "inst_02", "ip_or_proxy": "http://user:pass@proxy2.example.com:8080", "account_label": "Compte 2 (Famille)" },
+    { "instance_id": "inst_03", "ip_or_proxy": "http://user:pass@proxy3.example.com:8080", "account_label": "Compte 3 (Ami A)" },
+    { "instance_id": "inst_04", "ip_or_proxy": "http://user:pass@proxy4.example.com:8080", "account_label": "Compte 4 (Ami B)" },
+    { "instance_id": "inst_05", "ip_or_proxy": "http://user:pass@proxy5.example.com:8080", "account_label": "Compte 5" },
+    { "instance_id": "inst_06", "ip_or_proxy": "http://user:pass@proxy6.example.com:8080", "account_label": "Instance 6" },
+    { "instance_id": "inst_07", "ip_or_proxy": "http://user:pass@proxy7.example.com:8080", "account_label": "Instance 7" },
+    { "instance_id": "inst_08", "ip_or_proxy": "http://user:pass@proxy8.example.com:8080", "account_label": "Instance 8" },
+    { "instance_id": "inst_09", "ip_or_proxy": "http://user:pass@proxy9.example.com:8080", "account_label": "Instance 9" },
+    { "instance_id": "inst_10", "ip_or_proxy": "http://user:pass@proxy10.example.com:8080", "account_label": "Instance 10" },
+    { "instance_id": "inst_11", "ip_or_proxy": "http://user:pass@proxy11.example.com:8080", "account_label": "Instance 11" },
+    { "instance_id": "inst_12", "ip_or_proxy": "http://user:pass@proxy12.example.com:8080", "account_label": "Instance 12" },
+    { "instance_id": "inst_13", "ip_or_proxy": "http://user:pass@proxy13.example.com:8080", "account_label": "Instance 13" },
+    { "instance_id": "inst_14", "ip_or_proxy": "http://user:pass@proxy14.example.com:8080", "account_label": "Instance 14" },
+    { "instance_id": "inst_15", "ip_or_proxy": "http://user:pass@proxy15.example.com:8080", "account_label": "Instance 15" },
+    { "instance_id": "inst_16", "ip_or_proxy": "http://user:pass@proxy16.example.com:8080", "account_label": "Instance 16" },
+    { "instance_id": "inst_17", "ip_or_proxy": "http://user:pass@proxy17.example.com:8080", "account_label": "Instance 17" },
+    { "instance_id": "inst_18", "ip_or_proxy": "http://user:pass@proxy18.example.com:8080", "account_label": "Instance 18" },
+    { "instance_id": "inst_19", "ip_or_proxy": "http://user:pass@proxy19.example.com:8080", "account_label": "Instance 19" },
+    { "instance_id": "inst_20", "ip_or_proxy": "http://user:pass@proxy20.example.com:8080", "account_label": "Instance 20" }
+  ]
+}
