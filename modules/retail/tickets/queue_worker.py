@@ -65,6 +65,8 @@ class QueueWorkerConfig:
     chrome_binary_path: Optional[str] = None
     enable_keepalive: bool = True
     keepalive_interval_sec: float = 15.0
+    keepalive_min_interval_sec: float = 7.0
+    keepalive_max_interval_sec: float = 23.0
 
 
 # [FEATURE: HEADLESS_QUEUE_WORKER] Real browser queue listener with microsecond API handoff
@@ -165,15 +167,28 @@ class HeadlessQueueWorker:
 
     async def _natural_keepalive_loop(self) -> None:
         """
-        Sends periodic subtle mouse movements and scroll events while waiting in queue.
-        Prevents Chromium from throttling background tabs and maintaining session liveliness.
+        Sends randomized subtle mouse movements and scroll events while waiting in queue.
+        Prevents Chromium from throttling background tabs and maintains realistic session liveliness.
+        Uses randomized intervals (anti-fingerprinting) instead of static periodic pulses.
         """
         import random
         while self.is_running and not self.is_admitted:
             try:
-                await asyncio.sleep(self.config.keepalive_interval_sec)
+                # Random interval with uniform jitter between min and max bounds to defeat periodic analysis
+                interval = random.uniform(
+                    self.config.keepalive_min_interval_sec,
+                    self.config.keepalive_max_interval_sec,
+                )
+                await asyncio.sleep(interval)
                 if self._page and not self._page.is_closed():
-                    await self._page.mouse.move(random.randint(150, 450), random.randint(150, 450))
+                    target_x = random.randint(100, 800)
+                    target_y = random.randint(100, 600)
+                    steps = random.randint(3, 8)
+                    await self._page.mouse.move(target_x, target_y, steps=steps)
+                    # Natural scroll pulse with 35% probability
+                    if random.random() < 0.35:
+                        delta_y = random.choice([40, -40, 80, -80])
+                        await self._page.mouse.wheel(delta_x=0, delta_y=delta_y)
             except asyncio.CancelledError:
                 break
             except Exception as keepalive_err:

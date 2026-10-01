@@ -172,6 +172,19 @@ class TicketWorker:
                     self.ui_queue.put(("log", "[NTFY] Alerte envoyée sur votre smartphone via ntfy.sh"))
                 except Exception as e:
                     self.ui_queue.put(("log", f"[NTFY] Note alerte: {e}"))
+
+            # Sonnerie d'alerte Windows et ouverture automatique du paiement
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                pass
+
+            if self.checkout_url:
+                try:
+                    webbrowser.open(self.checkout_url)
+                except Exception:
+                    pass
         else:
             self.ui_queue.put(("status", ("ÉCHEC DU DROP", "#FF1744")))
             self.ui_queue.put(("log", f"[✖] Échec de la réservation : {result.error} (HTTP {result.status_code})"))
@@ -213,6 +226,18 @@ class TicketWorker:
                         )
                     )
                     await notifier.close()
+                except Exception:
+                    pass
+
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                pass
+
+            if self.checkout_url:
+                try:
+                    webbrowser.open(self.checkout_url)
                 except Exception:
                     pass
         else:
@@ -266,6 +291,74 @@ class TicketWorker:
             self.ui_queue.put(
                 ("log", f"[TOMBOLA] Gagnant absolu : {best.ip_address} avec la place #{best.queue_number:,} (en {elapsed_ms:.1f} ms)")
             )
+
+    async def run_autopilot_pipeline(
+        self,
+        target_url: str,
+        event_id: str,
+        category_id: str,
+        quantity: int,
+        lead_time_ms: float,
+        ip_list: list[str],
+        golden_threshold: int = 500,
+        drop_time_utc: float | None = None,
+        ntfy_topic: str | None = None,
+    ):
+        """
+        Mode Autopilote Continu (Zéro-Latence Humaine) :
+        1. Tirage Tombola simultané sur 20 IPs.
+        2. Tri instantané et détection du Ticket d'or (< 1 ms).
+        3. Transfert automatique de la session gagnante.
+        4. Pré-chauffe HTTP/2 immédiate sur socket dédiée.
+        5. Déclenchement automatique du tir T0.
+        6. Si drop complet, bascule automatique sur le rattrapage des paniers (Wave Sniping).
+        """
+        self.ui_queue.put(("status", ("AUTOPILOTE ACTIF", "#FF9100")))
+        self.ui_queue.put(("log", "[AUTOPILOTE] ⚡ Démarrage du pipeline automatisé de bout en bout (0 clic)..."))
+        if ntfy_topic:
+            self.ntfy_topic = ntfy_topic
+
+        # Étape 1 : Tirage tombola
+        await self.run_lottery_survey(
+            ip_list=ip_list,
+            golden_threshold=golden_threshold,
+            min_keep=2,
+            max_keep=5,
+        )
+
+        best = self.lottery_selector.best_ticket()
+        if not best:
+            self.ui_queue.put(("status", ("ÉCHEC TOMBOLA", "#FF1744")))
+            self.ui_queue.put(("log", "[AUTOPILOTE] ❌ Aucun ticket exploitable. Arrêt du pipeline."))
+            return
+
+        self.ui_queue.put(("best_ip_transferred", best))
+        self.ui_queue.put(
+            ("log", f"[AUTOPILOTE] ⚡ Transfert instantané de la session {best.ip_address} (#{best.queue_number}). Pré-chauffe...")
+        )
+
+        # Étape 2 : Armement de la socket HTTP/2
+        session_cookie = f"session_{best.ip_address.replace('.', '_')}"
+        await self.arm_engine(
+            target_url=target_url,
+            event_id=event_id,
+            category_id=category_id,
+            quantity=quantity,
+            lead_time_ms=lead_time_ms,
+            session_cookie=session_cookie,
+            drop_time_utc=drop_time_utc,
+        )
+
+        # Étape 3 : Déclenchement du tir
+        self.ui_queue.put(("log", "[AUTOPILOTE] ⚡ Déclenchement du tir de réservation immédiat..."))
+        await self.trigger_drop()
+
+        # Étape 4 : Fallback automatique en Wave Sniping si non capturé
+        if not self.checkout_url:
+            self.ui_queue.put(
+                ("log", "[AUTOPILOTE] ⚡ Places épuisées à l'ouverture. Enclenchement automatique de la surveillance des paniers expirés...")
+            )
+            await self.run_cart_release_sniper()
 
 
 class BilletterieSniperApp:
@@ -427,6 +520,19 @@ class BilletterieSniperApp:
         btn_frame = tk.Frame(form_frame, bg="#181818", pady=6)
         btn_frame.pack(fill="x")
 
+        # ⚡ Pipeline Autopilote Continu 1-Clic
+        self.btn_autopilot = tk.Button(
+            btn_frame,
+            text="⚡ LANCER LE PIPELINE AUTOPILOTE COMPLET (20 IPs ➔ Tir T0 ➔ Paiement)",
+            font=("Segoe UI", 9, "bold"),
+            bg="#00E676",
+            fg="#000000",
+            relief="flat",
+            pady=7,
+            command=self._on_full_autopilot,
+        )
+        self.btn_autopilot.pack(fill="x", pady=(0, 6))
+
         row_btn1 = tk.Frame(btn_frame, bg="#181818")
         row_btn1.pack(fill="x", pady=2)
 
@@ -509,6 +615,21 @@ class BilletterieSniperApp:
         self.entry_max_keep = tk.Entry(row_params, font=("Segoe UI", 8), width=5, bg="#2E2E2E", fg="#FFFFFF", insertbackground="white")
         self.entry_max_keep.insert(0, "5")
         self.entry_max_keep.pack(side="left", padx=(3, 0))
+
+        # Option Enchaînement Automatique (Autopilote)
+        self.var_auto_chain = tk.BooleanVar(value=True)
+        self.chk_autochain = tk.Checkbutton(
+            frame,
+            text="⚡ Mode Autopilote : Enchaîner automatiquement (Tombola ➔ Sélection ➔ Armement ➔ Tir T0)",
+            variable=self.var_auto_chain,
+            font=("Segoe UI", 9, "bold"),
+            fg="#00E676",
+            bg="#181818",
+            selectcolor="#262626",
+            activebackground="#181818",
+            activeforeground="#00E676",
+        )
+        self.chk_autochain.pack(anchor="w", pady=(2, 4))
 
         # Launch Button
         self.btn_run_tombola = tk.Button(
@@ -643,9 +764,18 @@ class BilletterieSniperApp:
                             bg="#00E676",
                             fg="#000000",
                         )
+                elif msg_type == "best_ip_transferred":
+                    best = data
+                    self.entry_cookie.delete(0, "end")
+                    self.entry_cookie.insert(0, f"session_{best.ip_address.replace('.', '_')}")
+                    self.notebook.select(self.tab_sniper)
                 elif msg_type == "lottery_results":
                     all_sorted, kept, discarded, elapsed_ms = data
                     self.btn_run_tombola.configure(state="normal", text="🎰 LANCER LE TIRAGE TOMBOLA (20 IPs SIMULTANÉES)")
+                    self.btn_autopilot.configure(
+                        state="normal",
+                        text="⚡ LANCER LE PIPELINE AUTOPILOTE COMPLET (20 IPs ➔ Tir T0 ➔ Paiement)",
+                    )
 
                     # Clear existing items
                     for item in self.tree_tombola.get_children():
@@ -669,10 +799,49 @@ class BilletterieSniperApp:
                     self.btn_apply_best.configure(state="normal")
                     self.log(f"[TOMBOLA] Tableau mis à jour : {len(kept)} retenues, {len(discarded)} coupées en {elapsed_ms:.1f} ms.")
 
+                    if getattr(self, "var_auto_chain", None) and self.var_auto_chain.get():
+                        self.root.after(100, self._auto_continue_after_tombola)
+
         except queue.Empty:
             pass
         finally:
             self.root.after(50, self._poll_queue)
+
+    def _auto_continue_after_tombola(self):
+        best = self.worker.lottery_selector.best_ticket()
+        if best:
+            self._on_apply_best_ip()
+            self.log("[AUTOPILOTE] ⚡ Enchaînement automatique : Armement de la socket HTTP/2...")
+            self._on_arm()
+            self.root.after(350, self._on_fire)
+
+    def _on_full_autopilot(self):
+        url = self.entry_url.get().strip()
+        event_id = self.entry_event_id.get().strip()
+        cat = self.entry_cat.get().strip()
+        qty = int(self.combo_qty.get().strip() or "1")
+        lead = float(self.entry_lead.get().strip() or "35.0")
+        ntfy = self.entry_ntfy.get().strip()
+
+        sample_20 = [f"192.168.10.{i}" for i in range(1, 21)]
+        golden = int(self.entry_golden.get().strip() or "500")
+
+        self.btn_autopilot.configure(state="disabled", text="⚡ AUTOPILOTE ACTIF (20 IPs ➔ Tir T0)...")
+        self.btn_run_tombola.configure(state="disabled", text="⚡ AUTOPILOTE EN COURS...")
+        self.notebook.select(self.tab_tombola)
+
+        self.worker.run_coro(
+            self.worker.run_autopilot_pipeline(
+                target_url=url,
+                event_id=event_id,
+                category_id=cat,
+                quantity=qty,
+                lead_time_ms=lead,
+                ip_list=sample_20,
+                golden_threshold=golden,
+                ntfy_topic=ntfy if ntfy else None,
+            )
+        )
 
 
 def launch_gui():

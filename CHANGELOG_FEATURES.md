@@ -84,3 +84,20 @@
 - Détection proactive des challenges interactifs (`check_interactive_challenge`) pour les formulaires de vérification humaine.
 **Attention**:
 - Si `browser_worker` n'est pas fourni ou inactif, le moteur bascule automatiquement sur le transport haute performance `PrewarmedHttpClient`.
+
+## [2026-10-01] RANDOMIZED_KEEPALIVE_ANTI_FINGERPRINTING
+**Fichiers**: `modules/retail/tickets/queue_worker.py`, `tests/test_queue_worker.py`
+**Raison**: Remplacer la périodicité fixe de 15s (détectable par analyse fréquentielle FFT des WAF type Akamai/DataDome) par un jitter aléatoire et des interactions naturelles.
+**Logique**:
+- Intervalles variables configurables (`keepalive_min_interval_sec=7.0`, `keepalive_max_interval_sec=23.0`) avec distribution uniforme.
+- Déplacements de curseur non-linéaires en plusieurs étapes interpolées (`steps=3..8`) et coordonnées aléatoires.
+- Micro-scrolls occasionnels (35% de probabilité) pour simuler la consultation inactive d'une page par un utilisateur réel.
+
+## [2026-10-01] FULL_AUTOPILOT_PIPELINE
+**Fichiers**: `gui/app.py`, `Lancer_Sniper.bat`
+**Raison**: Éliminer l'intégralité de la latence humaine (5 à 15 secondes d'hésitation et de clics manuels) entre la loterie des 20 IPs, la sélection du ticket d'or, l'armement de la socket et le tir T0.
+**Logique**:
+- Implémentation de `run_autopilot_pipeline()` dans `TicketWorker` : enchaîne sans interruption le tirage 20 IP, le tri adaptatif (< 1 ms), l'injection de cookies, la pré-chauffe HTTP/2 et le tir de réservation immédiat.
+- En cas de drop saturé, enclenchement automatique et autonome du rattrapage des paniers abandonnés ("Wave Sniping") sans intervention utilisateur.
+- Alerte sonore Windows native (`winsound.MessageBeep`) et ouverture automatique de la page de paiement dès que les places sont verrouillées au panier.
+- Ajout du bouton 1-clic `LANCER LE PIPELINE AUTOPILOTE COMPLET` et de la case à cocher d'enchaînement automatique dans l'onglet Tombola.

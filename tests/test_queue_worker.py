@@ -95,6 +95,17 @@ class TestHeadlessQueueWorker(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             asyncio.run(run_unstarted_fetch())
 
+    def test_randomized_keepalive_configuration(self):
+        config = QueueWorkerConfig(
+            worker_id="test_jitter_worker",
+            target_queue_url="https://example.com/waiting",
+            keepalive_min_interval_sec=5.0,
+            keepalive_max_interval_sec=15.0,
+        )
+        self.assertEqual(config.keepalive_min_interval_sec, 5.0)
+        self.assertEqual(config.keepalive_max_interval_sec, 15.0)
+        self.assertTrue(config.keepalive_min_interval_sec < config.keepalive_max_interval_sec)
+
 
 if __name__ == "__main__":
     unittest.main()
