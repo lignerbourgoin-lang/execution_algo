@@ -344,6 +344,25 @@ class TestPrewarmedHttpClient(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen_keys, ["key-1"])
         self.assertEqual(result["body"], {"ok": True})
 
+    async def test_prewarm_custom_probe_path(self):
+        seen_paths = []
+
+        def handler(request):
+            seen_paths.append(request.url.path)
+            return httpx.Response(200, headers={"Content-Type": "application/json"})
+
+        client = PrewarmedHttpClient(
+            "https://example.com",
+            http2=False,
+            transport=httpx.MockTransport(handler),
+            probe_path="/api/health",
+        )
+        prewarm_success = await client.prewarm()
+        await client.close()
+        self.assertTrue(prewarm_success)
+        self.assertIn("/api/health", seen_paths)
+
+
 
 class AlwaysSignal(BaseStrategy):
     def evaluate(self, market_data):

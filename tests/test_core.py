@@ -10,8 +10,9 @@ Validates:
 
 import asyncio
 import json
-import sys
 import os
+import sys
+import time
 import unittest
 import httpx
 
@@ -71,6 +72,23 @@ class TestAdaptiveRateLimiter(unittest.TestCase):
 
         # Rate should begin recovering toward base_rate
         self.assertGreater(limiter.current_rate, throttled_rate)
+
+    def test_wait_for_slot_under_penalty(self):
+        limiter = AdaptiveRateLimiter(base_rate=100.0, burst_capacity=10.0)
+        # Apply a small penalty of 0.05s
+        limiter.penalty_until_ns = time.perf_counter_ns() + int(0.05 * 1_000_000_000)
+        limiter.bucket.last_update_ns = limiter.penalty_until_ns
+        limiter.bucket.tokens = 0.0
+
+        async def run_wait():
+            start_epoch = time.perf_counter()
+            waited_ms = await limiter.wait_for_slot()
+            elapsed_sec = time.perf_counter() - start_epoch
+            return waited_ms, elapsed_sec
+
+        waited_ms, elapsed_sec = asyncio.run(run_wait())
+        self.assertGreaterEqual(waited_ms, 40.0)
+        self.assertGreaterEqual(elapsed_sec, 0.04)
 
 
 class TestLatencyTracker(unittest.TestCase):

@@ -60,45 +60,62 @@ class TokenBucketLimiter:
         self.last_update_ns = time.perf_counter_ns()
         self._lock = asyncio.Lock()
 
-    def _refill(self):
-        now_ns = time.perf_counter_ns()
-        elapsed_sec = (now_ns - self.last_update_ns) / 1_000_000_000.0
-        self.tokens = min(self.capacity, self.tokens + elapsed_sec * self.rate)
-        self.last_update_ns = now_ns
+    def _refill(self, now_ns: Optional[int] = None):
+        if now_ns is None:
+            now_ns = time.perf_counter_ns()
+        if now_ns > self.last_update_ns:
+            elapsed_sec = (now_ns - self.last_update_ns) / 1_000_000_000.0
+            self.tokens = min(self.capacity, self.tokens + elapsed_sec * self.rate)
+            self.last_update_ns = now_ns
 
     def try_acquire(self, tokens: float = 1.0) -> bool:
         """Non-blocking token check. Returns True if token was acquired immediately."""
-        self._refill()
+        now_ns = time.perf_counter_ns()
+        if now_ns < self.last_update_ns:
+            return False
+        self._refill(now_ns)
         if self.tokens >= tokens:
             self.tokens -= tokens
             return True
         return False
 
-    async def acquire(self, tokens: float = 1.0) -> float:
+    async def acquire(self, tokens: float = 1.0, min_start_ns: int = 0) -> float:
         """
         Asynchronous acquisition.
-        Calculates required wait time inside the lock, then sleeps outside
-        the lock to prevent serializing other concurrent tasks.
+        Calculates required wait time inside the lock (respecting min_start_ns for penalties),
+        then sleeps outside the lock to prevent serializing other concurrent tasks.
         Returns the duration waited in milliseconds.
         """
         async with self._lock:
-            self._refill()
-            if self.tokens >= tokens:
+            now_ns = time.perf_counter_ns()
+            effective_now_ns = max(now_ns, min_start_ns)
+
+            # Refill tokens up to effective start time
+            if effective_now_ns > self.last_update_ns:
+                elapsed_sec = (effective_now_ns - self.last_update_ns) / 1_000_000_000.0
+                self.tokens = min(self.capacity, self.tokens + elapsed_sec * self.rate)
+                self.last_update_ns = effective_now_ns
+
+            # Immediate acquisition if enough tokens and no future start constraint
+            if self.tokens >= tokens and effective_now_ns <= now_ns:
                 self.tokens -= tokens
                 return 0.0
 
             # Calculate exact time to wait until enough tokens are replenished
-            needed = tokens - self.tokens
-            wait_seconds = needed / self.rate
-            # Reserve slot by pushing virtual baseline forward
+            needed = max(0.0, tokens - self.tokens)
+            wait_seconds = needed / self.rate if self.rate > 0 else 0.0
+
+            target_ns = max(self.last_update_ns, effective_now_ns) + int(wait_seconds * 1_000_000_000)
             self.tokens = 0.0
-            self.last_update_ns = max(self.last_update_ns, time.perf_counter_ns()) + int(wait_seconds * 1_000_000_000)
+            self.last_update_ns = target_ns
+
+            total_wait_sec = max(0.0, (target_ns - now_ns) / 1_000_000_000.0)
 
         # Sleep outside the lock so other coroutines can acquire slots concurrently
-        if wait_seconds > 0:
-            await asyncio.sleep(wait_seconds)
+        if total_wait_sec > 0:
+            await asyncio.sleep(total_wait_sec)
 
-        return wait_seconds * 1000.0
+        return total_wait_sec * 1000.0
 
 
 class AdaptiveRateLimiter:
@@ -121,13 +138,12 @@ class AdaptiveRateLimiter:
         self.consecutive_successes = 0
 
     async def wait_for_slot(self) -> float:
-        """Waits if penalty is active or if token bucket is exhausted."""
-        now_ns = time.perf_counter_ns()
-        if now_ns < self.penalty_until_ns:
-            delay_sec = (self.penalty_until_ns - now_ns) / 1_000_000_000.0
-            await asyncio.sleep(delay_sec)
-
-        return await self.bucket.acquire(1.0)
+        """
+        Waits if penalty is active or if token bucket is exhausted.
+        Combines penalty backoff and token deficit into a single unified sleep,
+        eliminating redundant double-sleep event loop wakeups.
+        """
+        return await self.bucket.acquire(1.0, min_start_ns=self.penalty_until_ns)
 
     def on_response(self, status_code: int, headers: Optional[Dict[str, Any]] = None):
         """
@@ -151,6 +167,9 @@ class AdaptiveRateLimiter:
 
             self.current_rate = max(self.min_rate, self.current_rate * RATE_CUT_FACTOR)
             self.bucket.rate = self.current_rate
+            # Zero out remaining tokens and advance baseline to prevent burst after penalty
+            self.bucket.tokens = 0.0
+            self.bucket.last_update_ns = max(self.bucket.last_update_ns, self.penalty_until_ns)
 
         elif 200 <= status_code < 300:
             self.consecutive_successes += 1

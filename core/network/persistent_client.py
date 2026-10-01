@@ -45,8 +45,10 @@ class PrewarmedHttpClient:
         headers: Optional[Dict[str, str]] = None,
         http2: bool = True,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        probe_path: str = "/",
     ):
         self.base_url = base_url.rstrip("/")
+        self.probe_path = probe_path
         self.heartbeat_interval_sec = heartbeat_interval_sec
         self.rate_limiter = rate_limiter or AdaptiveRateLimiter(base_rate=10.0, burst_capacity=20.0)
         self.telemetry = telemetry or LatencyTracker()
@@ -86,29 +88,32 @@ class PrewarmedHttpClient:
         self.is_warmed_up = False
         self.negotiated_http_version: Optional[str] = None
 
-    async def start(self):
+    async def start(self, probe_path: Optional[str] = None):
         """Initializes and pre-warms connection, then starts heartbeat loop."""
         self._is_running = True
-        await self.prewarm()
+        if probe_path:
+            self.probe_path = probe_path
+        await self.prewarm(probe_path=probe_path)
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
-    async def prewarm(self) -> bool:
-        """Sends an initial probe to complete DNS, TCP and TLS handshakes."""
+    async def prewarm(self, probe_path: Optional[str] = None) -> bool:
+        """Sends an initial probe to complete DNS, TCP and TLS handshakes on target route."""
+        target_path = probe_path or self.probe_path
         try:
-            response = await self.client.head("/", timeout=PREWARM_TIMEOUT_SEC)
+            response = await self.client.head(target_path, timeout=PREWARM_TIMEOUT_SEC)
         except httpx.HTTPError as head_error:
             logger.info("HEAD prewarm failed (%s), retrying with streamed GET", head_error)
             try:
-                async with self.client.stream("GET", "/", timeout=PREWARM_TIMEOUT_SEC) as response:
+                async with self.client.stream("GET", target_path, timeout=PREWARM_TIMEOUT_SEC) as response:
                     pass
             except httpx.HTTPError as get_error:
-                logger.warning("Prewarm failed for %s: %s", self.base_url, get_error)
+                logger.warning("Prewarm failed for %s%s: %s", self.base_url, target_path, get_error)
                 self.is_warmed_up = False
                 return False
 
         self.negotiated_http_version = response.http_version
         self.is_warmed_up = True
-        logger.info("Prewarmed %s over %s", self.base_url, self.negotiated_http_version)
+        logger.info("Prewarmed %s%s over %s", self.base_url, target_path, self.negotiated_http_version)
         return True
 
     async def _heartbeat_loop(self):
@@ -116,7 +121,7 @@ class PrewarmedHttpClient:
         while self._is_running:
             await asyncio.sleep(self.heartbeat_interval_sec)
             try:
-                await self.client.head("/", timeout=HEARTBEAT_TIMEOUT_SEC)
+                await self.client.head(self.probe_path, timeout=HEARTBEAT_TIMEOUT_SEC)
                 self.is_warmed_up = True
             except httpx.HTTPError as error:
                 # The next request will reconnect, but the operator must know the socket is cold.

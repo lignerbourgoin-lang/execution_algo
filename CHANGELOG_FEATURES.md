@@ -1,5 +1,17 @@
 # Changelog Features
 
+## [2026-10-01] ENGINE_PERF_OPTIMIZATIONS
+**Fichiers**: `core/rate_limiter/limiter.py`, `core/network/persistent_client.py`, `modules/retail/tickets/ticket_engine.py`, `tests/test_core.py`, `tests/test_ticketing.py`, `tests/test_tickets.py`
+**Raison**: Optimisation du chemin critique de tirage et de surveillance des paniers expires (wave sniping) pour eliminer les doubles reveils asyncio, la derive temporelle de polling et la surcharge systeme au T0.
+**Logique**:
+- **Rate limiter unifie** : Fusion du calcul de penalite (HTTP 429/503 Retry-After) et du deficit de jetons dans `TokenBucketLimiter.acquire(..., min_start_ns=...)`. Remplacement du double sommeil sequentiel par un unique `asyncio.sleep()`, garantissant un espacement parfait des requetes sans reveil parasite de la boucle d'evenements.
+- **Polling par echeance stricte (Deadline-Based)** : Dans `monitor_cart_releases()`, substitution de l'ancien `sleep(interval + latence)` par un cadencement base sur horloge monotone (`cycle_deadline_monotonic = max(...)`). Les vagues de sniping (ex: 150 ms) conservent une cadence stricte et eliminent toute derive cumulative due aux allers-retours reseau.
+- **Prechauffage sur route API ciblee** : Extension de `PrewarmedHttpClient` et `start()` avec `probe_path` parametrable. `TicketDropExecutor` prechauffe directement la route API de billetterie (`/api/events/{id}/availability`) plutot que la racine CDN statique `/`.
+- **Preconstruction de burst sans allocation** : Generation en amont de `_prebuilt_burst_requests` pour la categorie principale avec cles d'idempotence distinctes. Au T0, les reessais ultra-rapides (micro-burst) reutilisent ces requetes preconstruites sans serialisation JSON ni appel systeme d'entropie UUID (`CryptGenRandom`).
+- **Elagage architectural** : Suppression du dossier duplique obsolète `sniper/` et assainissement des caches `__pycache__`.
+**Attention**:
+- Chaque tentative du micro-burst dispose de sa propre cle d'idempotence precalculee unique pour eviter tout rejet par deduplication cote serveur distant.
+
 ## [2026-10-01] IP_SUBNET_POOL
 **Fichiers**: `core/network/ip_pool.py`, `core/network/__init__.py`, `tests/test_ip_pool.py`
 **Raison**: Gestion de pools d'adresses IP pour le découpage de sous-réseaux CIDR, la rotation de requêtes et le binding sur interfaces réseau locales.

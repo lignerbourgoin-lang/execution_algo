@@ -83,6 +83,7 @@ class TicketDropExecutor(BaseExecutor):
         self.is_armed = False
         self.active_cart: Optional[CartReservation] = None
         self._prebuilt_requests: Dict[str, httpx.Request] = {}
+        self._prebuilt_burst_requests: Dict[str, List[httpx.Request]] = {}
 
     def _prepare_headers(self) -> Dict[str, str]:
         headers = {}
@@ -96,35 +97,51 @@ class TicketDropExecutor(BaseExecutor):
     def prebuild_reservation_requests(self):
         """
         Pre-constructs binary HTTP request objects for primary and fallback categories.
-        Guarantees zero-overhead JSON serialization, header parsing, or URL encoding at T0.
+        Pre-generates complete burst queues with distinct idempotency keys.
+        Guarantees zero-overhead JSON serialization, header parsing, and UUID entropy syscalls at T0.
         """
         headers = self._prepare_headers()
         categories = [self.config.category_id] + self.config.fallback_categories
 
-        for cat in categories:
-            action_id = f"ticket_{self.config.event_id}_{cat}_{uuid.uuid4().hex[:8]}"
-            req = self.client.build_fast_request(
-                method="POST",
-                endpoint=f"/api/events/{self.config.event_id}/reserve",
-                json_data={
-                    "event_id": self.config.event_id,
-                    "category_id": cat,
-                    "quantity": self.config.quantity,
-                },
-                headers=headers,
-                idempotency_key=action_id,
-            )
-            self._prebuilt_requests[cat] = req
+        for cat_idx, cat in enumerate(categories):
+            is_primary = (cat_idx == 0)
+            burst_count = (1 + self.config.burst_retries) if is_primary else 1
+            burst_requests: List[httpx.Request] = []
+
+            for attempt in range(burst_count):
+                action_id = f"ticket_{self.config.event_id}_{cat}_b{attempt}_{uuid.uuid4().hex[:8]}"
+                req = self.client.build_fast_request(
+                    method="POST",
+                    endpoint=f"/api/events/{self.config.event_id}/reserve",
+                    json_data={
+                        "event_id": self.config.event_id,
+                        "category_id": cat,
+                        "quantity": self.config.quantity,
+                    },
+                    headers=headers,
+                    idempotency_key=action_id,
+                )
+                burst_requests.append(req)
+
+            self._prebuilt_burst_requests[cat] = burst_requests
+            if burst_requests:
+                self._prebuilt_requests[cat] = burst_requests[0]
 
     async def initialize(self):
         """
         Pre-warms TCP/TLS connection and synchronizes high-precision atomic clock.
+        Warms origin API endpoint route if supported to exercise true backend path.
         """
         # 1. Non-blocking NTP sync
         await self.ntp.sync_async()
 
-        # 2. Pre-warm HTTP/2 socket
-        await self.client.start()
+        # 2. Pre-warm HTTP/2 socket targeting the event API route
+        api_probe_path = f"/api/events/{self.config.event_id}/availability"
+        if hasattr(self.client, "start"):
+            try:
+                await self.client.start(probe_path=api_probe_path)
+            except TypeError:
+                await self.client.start()
 
         # 3. Pre-build binary requests
         self.prebuild_reservation_requests()
@@ -178,8 +195,15 @@ class TicketDropExecutor(BaseExecutor):
         for cat_idx, cat in enumerate(categories):
             is_primary = (cat_idx == 0)
             max_attempts = (1 + self.config.burst_retries) if is_primary else 1
+            prebuilt_burst_list = self._prebuilt_burst_requests.get(cat, [])
 
             for attempt in range(max_attempts):
+                # Retrieve pre-allocated zero-overhead binary request if available
+                prebuilt_req = prebuilt_burst_list[attempt] if attempt < len(prebuilt_burst_list) else None
+                extracted_key = prebuilt_req.headers.get("idempotency-key") if prebuilt_req is not None else None
+                action_id = extracted_key if extracted_key else f"ticket_{self.config.event_id}_{cat}_b{attempt}_{uuid.uuid4().hex[:8]}"
+
+
                 signal = Signal(
                     source="ticket_engine",
                     target_id=self.config.event_id,
@@ -189,7 +213,8 @@ class TicketDropExecutor(BaseExecutor):
                         "category_id": cat,
                         "quantity": self.config.quantity,
                         "auth_token": self.config.auth_token,
-                        "idempotency_key": f"ticket_{self.config.event_id}_{cat}_{uuid.uuid4().hex[:8]}",
+                        "idempotency_key": action_id,
+                        "_prebuilt_request": prebuilt_req,
                     },
                     urgency=3,
                 )
@@ -314,7 +339,7 @@ class TicketDropExecutor(BaseExecutor):
             category=category,
         )
 
-        prebuilt = self._prebuilt_requests.get(category)
+        prebuilt = payload.get("_prebuilt_request") or self._prebuilt_requests.get(category)
         if self.browser_worker and getattr(self.browser_worker, "is_running", False):
             endpoint = payload.get("reserve_endpoint", f"/api/events/{self.config.event_id}/reserve")
             reservation_body = {
@@ -444,12 +469,19 @@ class TicketDropExecutor(BaseExecutor):
             f"(categories: {watched_cats}, duration: {max_duration_sec}s)..."
         )
         headers = self._prepare_headers()
+        cycle_deadline_monotonic = time.perf_counter()
 
         while time.time() - start_time < max_duration_sec:
+            cycle_start_monotonic = time.perf_counter()
             elapsed = time.time() - start_time
             in_wave = any(w_start <= elapsed <= w_end for w_start, w_end in wave_windows_sec)
             current_interval = wave_poll_interval_sec if in_wave else poll_interval_sec
 
+            cycle_jitter_sec = (random.uniform(-jitter_ms, jitter_ms)) / 1000.0 if jitter_ms > 0 else 0.0
+            target_cycle_interval_sec = max(0.005, current_interval + cycle_jitter_sec)
+            cycle_deadline_monotonic = max(cycle_deadline_monotonic + target_cycle_interval_sec, cycle_start_monotonic + target_cycle_interval_sec)
+
+            rate_limited = False
             for cat in watched_cats:
                 check_endpoint = f"/api/events/{self.config.event_id}/availability?cat={cat}"
                 res = await self.client.execute_fast(
@@ -466,6 +498,8 @@ class TicketDropExecutor(BaseExecutor):
                     retry_after = float(res.get("headers", {}).get("retry-after", 2.0))
                     logger.warning(f"HTTP 429 Rate limited on availability check. Backing off for {retry_after}s.")
                     await asyncio.sleep(retry_after)
+                    cycle_deadline_monotonic = time.perf_counter()
+                    rate_limited = True
                     break
 
                 if status == 200:
@@ -490,10 +524,13 @@ class TicketDropExecutor(BaseExecutor):
                         if reserve_res.success:
                             return reserve_res
 
-            # Apply interval with jitter
-            jitter = (random.uniform(-jitter_ms, jitter_ms)) / 1000.0 if jitter_ms > 0 else 0.0
-            sleep_duration = max(0.005, current_interval + jitter)
-            await asyncio.sleep(sleep_duration)
+            # Deadline-based drift-free sleep to ensure strict cycle cadence
+            if not rate_limited:
+                remaining_cycle_sleep_sec = cycle_deadline_monotonic - time.perf_counter()
+                if remaining_cycle_sleep_sec > 0.001:
+                    await asyncio.sleep(remaining_cycle_sleep_sec)
+                else:
+                    await asyncio.sleep(0.001)
 
         logger.info("Cart release monitoring window expired.")
         return None

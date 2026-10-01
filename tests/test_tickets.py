@@ -32,14 +32,17 @@ class MockTicketingHttpClient:
         self.availability_responses = availability_responses or []
         self.calls = []
 
-    async def start(self):
+    async def start(self, probe_path=None):
         pass
 
     def build_fast_request(self, method, endpoint, json_data=None, content=None, headers=None, idempotency_key=None):
+        req_headers = dict(headers) if headers else {}
+        if idempotency_key:
+            req_headers["idempotency-key"] = idempotency_key
         return httpx.Request(
             method=method,
             url=f"https://billetterie.example.com{endpoint}",
-            headers=headers or {},
+            headers=req_headers,
         )
 
     async def send_fast(self, request, action_id):
@@ -284,6 +287,36 @@ class TestTicketDropEngine(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res.success)
         self.assertEqual(executor.active_cart.token, "tok_release_cat1")
         self.assertEqual(executor.active_cart.category_id, "CAT_1")
+
+    async def test_prebuilt_burst_requests_structure(self):
+        mock_client = MockTicketingHttpClient()
+        mock_ntp = MockNtpClient()
+        config = TicketConfig(
+            platform_name="billetterie_test",
+            target_url="https://billetterie.example.com",
+            event_id="BURST-PREBUILD-2026",
+            category_id="CAT_VIP",
+            fallback_categories=["CAT_STANDARD"],
+            quantity=2,
+            burst_retries=3,
+        )
+        executor = TicketDropExecutor(config=config, http_client=mock_client, ntp_client=mock_ntp)
+        await executor.initialize()
+
+        # Primary category must prebuild 1 + burst_retries = 4 requests
+        vip_burst = executor._prebuilt_burst_requests.get("CAT_VIP")
+        self.assertIsNotNone(vip_burst)
+        self.assertEqual(len(vip_burst), 4)
+
+        # Fallback category prebuilds 1 request
+        std_burst = executor._prebuilt_burst_requests.get("CAT_STANDARD")
+        self.assertIsNotNone(std_burst)
+        self.assertEqual(len(std_burst), 1)
+
+        # Ensure all burst idempotency keys are unique
+        vip_keys = [req.headers.get("idempotency-key") for req in vip_burst]
+        self.assertEqual(len(set(vip_keys)), 4)
+
 
 
 class TestDropTimeParser(unittest.TestCase):
