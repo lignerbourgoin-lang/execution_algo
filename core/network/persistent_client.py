@@ -123,29 +123,21 @@ class PrewarmedHttpClient:
                 self.is_warmed_up = False
                 logger.warning("Heartbeat to %s failed: %s", self.base_url, error)
 
-    async def execute_fast(
+    def build_fast_request(
         self,
         method: str,
         endpoint: str,
-        action_id: str,
         json_data: Optional[Dict[str, Any]] = None,
         content: Optional[bytes] = None,
         headers: Optional[Dict[str, str]] = None,
         idempotency_key: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> httpx.Request:
         """
-        Executes a priority action on the pre-warmed connection with microsecond tracking.
-        Supports both json_data and pre-serialized raw bytes.
-        Never raises on network errors: returns status_code 0 with an "error" field.
+        Pre-constructs the httpx.Request object ahead of time (zero-overhead at T0).
+        Serializes JSON, injects headers, and prepares URL before the critical firing path.
         """
-        trace = self.telemetry.start_trace(action_id=action_id, target=f"{self.base_url}{endpoint}")
-
-        await self.rate_limiter.wait_for_slot()
-        trace.mark_stage("rate_limiter_acquired")
-
         request_headers = dict(headers) if headers else {}
         if idempotency_key:
-            # Honoured by servers implementing the IETF Idempotency-Key draft; ignored elsewhere.
             request_headers["Idempotency-Key"] = idempotency_key
 
         request_kwargs: Dict[str, Any] = {}
@@ -156,16 +148,31 @@ class PrewarmedHttpClient:
         elif json_data is not None:
             request_kwargs["json"] = json_data
 
+        return self.client.build_request(
+            method=method,
+            url=endpoint,
+            headers=request_headers or None,
+            **request_kwargs,
+        )
+
+    async def send_fast(
+        self,
+        request: httpx.Request,
+        action_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Dispatches an already pre-built request with zero allocation or serialization overhead.
+        """
+        trace = self.telemetry.start_trace(action_id=action_id, target=str(request.url))
+
+        await self.rate_limiter.wait_for_slot()
+        trace.mark_stage("rate_limiter_acquired")
+
         dispatch_ns = time.perf_counter_ns()
         try:
-            response = await self.client.request(
-                method=method,
-                url=endpoint,
-                headers=request_headers or None,
-                **request_kwargs,
-            )
+            response = await self.client.send(request)
         except httpx.HTTPError as error:
-            logger.warning("%s %s%s failed: %r", method, self.base_url, endpoint, error)
+            logger.warning("%s %s failed: %r", request.method, request.url, error)
             trace.complete(success=False, error=repr(error))
             return {
                 "status_code": 0,
@@ -183,7 +190,7 @@ class PrewarmedHttpClient:
             try:
                 body = response.json()
             except ValueError:
-                logger.warning("Invalid JSON body from %s%s despite content-type", self.base_url, endpoint)
+                logger.warning("Invalid JSON body from %s despite content-type", request.url)
 
         trace.complete(success=(response.status_code < 400))
         return {
@@ -194,6 +201,30 @@ class PrewarmedHttpClient:
             "latency_breakdown": trace.get_breakdown(),
             "network_ms": round((received_ns - dispatch_ns) / NS_PER_MS, 3),
         }
+
+    async def execute_fast(
+        self,
+        method: str,
+        endpoint: str,
+        action_id: str,
+        json_data: Optional[Dict[str, Any]] = None,
+        content: Optional[bytes] = None,
+        headers: Optional[Dict[str, str]] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Convenience wrapper building and dispatching a request.
+        For zero-latency execution, call build_fast_request() ahead of time and send_fast() at T0.
+        """
+        request = self.build_fast_request(
+            method=method,
+            endpoint=endpoint,
+            json_data=json_data,
+            content=content,
+            headers=headers,
+            idempotency_key=idempotency_key,
+        )
+        return await self.send_fast(request=request, action_id=action_id)
 
     async def close(self):
         """Clean shutdown of heartbeat and HTTP client session."""

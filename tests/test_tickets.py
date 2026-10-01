@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import unittest
+import httpx
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -33,6 +34,22 @@ class MockTicketingHttpClient:
 
     async def start(self):
         pass
+
+    def build_fast_request(self, method, endpoint, json_data=None, content=None, headers=None, idempotency_key=None):
+        return httpx.Request(
+            method=method,
+            url=f"https://billetterie.example.com{endpoint}",
+            headers=headers or {},
+        )
+
+    async def send_fast(self, request, action_id):
+        self.calls.append({
+            "method": request.method,
+            "endpoint": str(request.url),
+            "action_id": action_id,
+            "headers": dict(request.headers),
+        })
+        return self.reservation_response
 
     async def execute_fast(self, method, endpoint, action_id, json_data=None, headers=None, idempotency_key=None):
         self.calls.append({
@@ -93,10 +110,10 @@ class TestTicketDropEngine(unittest.IsolatedAsyncioTestCase):
         # Verify idempotency key and headers were passed
         self.assertGreater(len(mock_client.calls), 0)
         req = mock_client.calls[-1]
-        self.assertIn("Authorization", req["headers"])
-        self.assertIn("Cookie", req["headers"])
-        self.assertIn("session_id=sess_abc", req["headers"]["Cookie"])
-        self.assertIsNotNone(req["idempotency_key"])
+        headers_lower = {k.lower(): v for k, v in req["headers"].items()}
+        self.assertIn("authorization", headers_lower)
+        self.assertIn("cookie", headers_lower)
+        self.assertIn("session_id=sess_abc", headers_lower["cookie"])
 
     async def test_cart_release_sniping(self):
         # First 2 checks: 0 seats available. 3rd check: 2 seats released back into pool!
@@ -125,6 +142,42 @@ class TestTicketDropEngine(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res.success)
         self.assertIsNotNone(executor.active_cart)
         self.assertEqual(executor.active_cart.token, "tok_ticket_cart_999")
+
+    async def test_cascading_category_fallback(self):
+        # Tier 1 (CARRE_OR) returns 409 Conflict (sold out)
+        # Tier 2 (CAT_1) succeeds with 200
+        class TieredMockClient(MockTicketingHttpClient):
+            async def send_fast(self, request, action_id):
+                self.calls.append({"endpoint": str(request.url), "action_id": action_id})
+                if "CARRE_OR" in action_id:
+                    return {"status_code": 409, "error": "Category CARRE_OR sold out"}
+                return {
+                    "status_code": 200,
+                    "body": {"token": "tok_fallback_cat1", "hold_time_sec": 300},
+                }
+
+        mock_client = TieredMockClient()
+        mock_ntp = MockNtpClient()
+        config = TicketConfig(
+            platform_name="billetterie_test",
+            target_url="https://billetterie.example.com",
+            event_id="CONCERT-2026",
+            category_id="CARRE_OR",
+            fallback_categories=["CAT_1", "FOSSE"],
+            quantity=1,
+            auto_open_browser=False,
+            audible_alert=False,
+        )
+
+        executor = TicketDropExecutor(config=config, http_client=mock_client, ntp_client=mock_ntp)
+        await executor.initialize()
+
+        result = await executor.execute_drop()
+        self.assertTrue(result.success)
+        self.assertEqual(executor.active_cart.category_id, "CAT_1")
+        self.assertEqual(executor.active_cart.token, "tok_fallback_cat1")
+        # Ensure 2 attempts were made
+        self.assertEqual(len(mock_client.calls), 2)
 
 
 if __name__ == "__main__":

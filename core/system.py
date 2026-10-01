@@ -117,3 +117,59 @@ def boost_process_performance() -> bool:
 def restore_process_performance() -> None:
     """Releases the timer resolution acquired by boost_process_performance()."""
     release_timer_resolution()
+
+
+@contextlib.contextmanager
+def freeze_garbage_collection() -> Iterator[None]:
+    """
+    Temporarily disables Python GC to prevent generational collection pauses during T0 execution.
+    Cleans young generation garbage beforehand.
+    """
+    import gc
+    gc.collect(1)
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.enable()
+
+
+def pin_thread_to_cpu(core_index: int = 2) -> bool:
+    """Pins calling thread to a specific CPU core to prevent core migration and cache churn."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            thread_handle = kernel32.GetCurrentThread()
+            mask = 1 << core_index
+            kernel32.SetThreadAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+            kernel32.SetThreadAffinityMask.restype = ctypes.c_size_t
+            result = kernel32.SetThreadAffinityMask(thread_handle, mask)
+            return bool(result)
+        except Exception as error:
+            logger.debug("SetThreadAffinityMask failed: %s", error)
+            return False
+    elif hasattr(os, "sched_setaffinity"):
+        try:
+            os.sched_setaffinity(0, {core_index})
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def play_success_alert() -> None:
+    """Audible beep alerting operator that a ticket/reservation was successfully secured."""
+    if sys.platform == "win32":
+        try:
+            import winsound
+
+            winsound.Beep(1200, 200)
+            winsound.Beep(1600, 400)
+            return
+        except Exception:
+            pass
+    print("\a", end="", flush=True)
+
