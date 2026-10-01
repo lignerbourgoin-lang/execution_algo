@@ -101,3 +101,12 @@
 - En cas de drop saturé, enclenchement automatique et autonome du rattrapage des paniers abandonnés ("Wave Sniping") sans intervention utilisateur.
 - Alerte sonore Windows native (`winsound.MessageBeep`) et ouverture automatique de la page de paiement dès que les places sont verrouillées au panier.
 - Ajout du bouton 1-clic `LANCER LE PIPELINE AUTOPILOTE COMPLET` et de la case à cocher d'enchaînement automatique dans l'onglet Tombola.
+
+## [2026-10-01] GUI_PRESETS_DROP_TIME_AND_PERSISTENCE
+**Fichiers**: `gui/app.py`, `tests/test_tickets.py`
+**Raison**: Permettre la planification exacte à l'heure T0 (`HH:MM:SS`), la bascule Chrome Anti-WAF dans l'interface, les presets plateformes immédiats et la mémorisation des réglages entre sessions.
+**Logique**:
+- Ajout du parsing d'heure `parse_drop_time_str(HH:MM:SS)` connectant l'interface graphique au scheduler atomique NTP (`wait_until_atomic_timestamp`).
+- Intégration de la case à cocher `Mode Chrome Natif (Anti-WAF)` déclenchant `HeadlessQueueWorker` pour un tir `execute_in_browser_fetch` direct.
+- Sélecteur de presets billetteries (Shotgun, Roland-Garros, Weezevent, Accor Arena, Fnac Spectacles) remplissant instantanément les URL et catégories.
+- Sauvegarde/chargement transparent des paramètres dans `config/gui_settings.json` (ignoré par Git pour protéger les cookies et tokens).

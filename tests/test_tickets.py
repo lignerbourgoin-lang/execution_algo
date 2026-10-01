@@ -286,6 +286,20 @@ class TestTicketDropEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(executor.active_cart.category_id, "CAT_1")
 
 
+class TestDropTimeParser(unittest.TestCase):
+    def test_parse_valid_time(self):
+        from gui.app import parse_drop_time_str
+        ts = parse_drop_time_str("10:00:00")
+        self.assertIsNotNone(ts)
+        self.assertIsInstance(ts, float)
+
+    def test_parse_empty_time(self):
+        from gui.app import parse_drop_time_str
+        self.assertIsNone(parse_drop_time_str(""))
+        self.assertIsNone(parse_drop_time_str("   "))
+        self.assertIsNone(parse_drop_time_str(None))
+
+
 if __name__ == "__main__":
     unittest.main()
 

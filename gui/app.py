@@ -42,6 +42,65 @@ from modules.retail.tickets.lottery_selector import (
     MultiIpLotteryOrchestrator,
 )
 
+GUI_SETTINGS_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "config", "gui_settings.json"))
+
+PLATFORM_PRESETS = {
+    "Custom / Démo (Example)": {
+        "url": "https://billetterie.example.com",
+        "event_id": "CONCERT-2026",
+        "categories": "CARRE_OR, CAT_1",
+    },
+    "Shotgun Live": {
+        "url": "https://api.shotgun.live",
+        "event_id": "event_12345",
+        "categories": "REGULAR, EARLY_BIRD",
+    },
+    "Roland-Garros Revente": {
+        "url": "https://tickets.rolandgarros.com",
+        "event_id": "RG-2026",
+        "categories": "COURT_CHATRIER, COURT_LENGLEN",
+    },
+    "Weezevent": {
+        "url": "https://api.weezevent.com",
+        "event_id": "billetterie_01",
+        "categories": "PASS_1_JOUR, PASS_3_JOURS",
+    },
+    "Accor Arena": {
+        "url": "https://billetterie.accorarena.com",
+        "event_id": "AA-EVENT",
+        "categories": "CATEGORIE_1, FOSSE_OR",
+    },
+    "Fnac Spectacles": {
+        "url": "https://www.fnacspectacles.com",
+        "event_id": "FNAC-SHOW",
+        "categories": "CAT_1, CAT_2",
+    },
+}
+
+
+def parse_drop_time_str(time_str: str) -> float | None:
+    """Parses HH:MM:SS or HH:MM:SS.mmm into UTC timestamp for today (None if empty)."""
+    if not time_str or not time_str.strip():
+        return None
+    try:
+        parts = time_str.strip().split(":")
+        if len(parts) < 2:
+            return None
+        now = datetime.now()
+        hour = int(parts[0])
+        minute = int(parts[1])
+        second = 0
+        microsecond = 0
+        if len(parts) >= 3:
+            sec_parts = parts[2].split(".")
+            second = int(sec_parts[0])
+            if len(sec_parts) > 1:
+                microsecond = int(float(f"0.{sec_parts[1]}") * 1_000_000)
+        target_dt = now.replace(hour=hour, minute=minute, second=second, microsecond=microsecond)
+        return target_dt.timestamp()
+    except Exception:
+        return None
+
 
 # [FEATURE: GUI_MULTI_IP_TOMBOLA] Integrated multi-IP lottery queue management and site presets
 # Raison: Provides direct visual control for 20-IP waiting rooms, adaptive pruning, and platform switching
@@ -55,6 +114,7 @@ class TicketWorker:
         self.ui_queue = ui_queue
         self.loop: asyncio.AbstractEventLoop = None
         self.http_client: PrewarmedHttpClient = None
+        self.browser_worker = None
         self.ntp = NtpClient()
         self.telemetry = LatencyTracker()
         self.executor: TicketDropExecutor = None
@@ -81,9 +141,10 @@ class TicketWorker:
         drop_time_utc: float | None = None,
         auth_token: str = "",
         session_cookie: str = "",
+        use_chrome: bool = False,
     ):
         boost_process_performance()
-        self.ui_queue.put(("log", f">> [1/3] Connexion & Pré-chauffe TLS vers {target_url}..."))
+        self.ui_queue.put(("log", f">> [1/3] Connexion & Pré-chauffe vers {target_url}..."))
 
         # 1. Synchronisation NTP
         sync_res = await self.ntp.sync_async()
@@ -97,6 +158,25 @@ class TicketWorker:
             rate_limiter=AdaptiveRateLimiter(base_rate=5.0, burst_capacity=10.0),
             telemetry=self.telemetry,
         )
+
+        # 3. Worker Chrome si demandé (Anti-WAF)
+        if use_chrome:
+            try:
+                from modules.retail.tickets.queue_worker import HeadlessQueueWorker, QueueWorkerConfig
+                worker_cfg = QueueWorkerConfig(
+                    worker_id="gui_chrome_worker",
+                    target_queue_url=target_url,
+                    headless=True,
+                    enable_keepalive=True,
+                )
+                self.browser_worker = HeadlessQueueWorker(worker_cfg)
+                await self.browser_worker.start()
+                self.ui_queue.put(("log", "[CHROME] 🛡️ Instance Chrome initialisée avec parité TLS 100%."))
+            except Exception as chrome_err:
+                self.ui_queue.put(("log", f"[CHROME] Repli sur socket direct ({chrome_err})"))
+                self.browser_worker = None
+        else:
+            self.browser_worker = None
 
         cookies = {"session_id": session_cookie} if session_cookie else None
         categories = [c.strip() for c in category_id.split(",") if c.strip()]
@@ -127,12 +207,17 @@ class TicketWorker:
             http_client=self.http_client,
             ntp_client=self.ntp,
             telemetry=self.telemetry,
+            browser_worker=self.browser_worker,
         )
 
         await self.executor.initialize()
         self.is_armed = True
         self.ui_queue.put(("status", ("ARMÉ & PRÊT", "#00E676")))
-        self.ui_queue.put(("log", f"[OK] Socket TLS connectée. Prêt pour tir T0 (Rafale 5x) ou rattrapage."))
+        if drop_time_utc and drop_time_utc > time.time():
+            sec_left = drop_time_utc - time.time()
+            self.ui_queue.put(("log", f"[OK] Moteur armé ! Tir programmé dans {sec_left:.1f} s (Rafale 5x)."))
+        else:
+            self.ui_queue.put(("log", f"[OK] Socket TLS connectée. Prêt pour tir T0 immédiat ou rattrapage."))
 
     async def trigger_drop(self):
         if not self.is_armed or not self.executor:
@@ -303,13 +388,14 @@ class TicketWorker:
         golden_threshold: int = 500,
         drop_time_utc: float | None = None,
         ntfy_topic: str | None = None,
+        use_chrome: bool = False,
     ):
         """
         Mode Autopilote Continu (Zéro-Latence Humaine) :
         1. Tirage Tombola simultané sur 20 IPs.
         2. Tri instantané et détection du Ticket d'or (< 1 ms).
         3. Transfert automatique de la session gagnante.
-        4. Pré-chauffe HTTP/2 immédiate sur socket dédiée.
+        4. Pré-chauffe HTTP/2 immédiate sur socket dédiée ou Chrome.
         5. Déclenchement automatique du tir T0.
         6. Si drop complet, bascule automatique sur le rattrapage des paniers (Wave Sniping).
         """
@@ -337,7 +423,7 @@ class TicketWorker:
             ("log", f"[AUTOPILOTE] ⚡ Transfert instantané de la session {best.ip_address} (#{best.queue_number}). Pré-chauffe...")
         )
 
-        # Étape 2 : Armement de la socket HTTP/2
+        # Étape 2 : Armement de la socket HTTP/2 ou Chrome
         session_cookie = f"session_{best.ip_address.replace('.', '_')}"
         await self.arm_engine(
             target_url=target_url,
@@ -347,6 +433,7 @@ class TicketWorker:
             lead_time_ms=lead_time_ms,
             session_cookie=session_cookie,
             drop_time_utc=drop_time_utc,
+            use_chrome=use_chrome,
         )
 
         # Étape 3 : Déclenchement du tir
@@ -383,6 +470,8 @@ class BilletterieSniperApp:
         self.worker_thread.start()
 
         self._build_ui()
+        self._load_settings()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(50, self._poll_queue)
 
     def _build_ui(self):
@@ -456,6 +545,15 @@ class BilletterieSniperApp:
         form_frame = tk.Frame(self.tab_sniper, bg="#181818", padx=12, pady=8)
         form_frame.pack(fill="both", expand=True)
 
+        # Preset Plateforme
+        row_preset = tk.Frame(form_frame, bg="#181818")
+        row_preset.pack(fill="x", pady=(0, 5))
+        tk.Label(row_preset, text="Preset / Plateforme :", font=("Segoe UI", 8, "bold"), fg="#FFD54F", bg="#181818").pack(side="left")
+        self.combo_preset = ttk.Combobox(row_preset, values=list(PLATFORM_PRESETS.keys()), state="readonly")
+        self.combo_preset.set("Custom / Démo (Example)")
+        self.combo_preset.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        self.combo_preset.bind("<<ComboboxSelected>>", self._on_preset_selected)
+
         # URL Billetterie
         tk.Label(form_frame, text="URL Billetterie / Hôte API :", font=("Segoe UI", 8, "bold"), fg="#90CAF9", bg="#181818").pack(anchor="w")
         self.entry_url = tk.Entry(form_frame, font=("Segoe UI", 9), bg="#262626", fg="#FFFFFF", insertbackground="white")
@@ -480,23 +578,30 @@ class BilletterieSniperApp:
         self.entry_cat.insert(0, "CARRE_OR, CAT_1")
         self.entry_cat.pack(fill="x", pady=2)
 
-        # Quantité & Lead Time
+        # Quantité, Lead Time & Heure Drop T0
         row_qty_lead = tk.Frame(form_frame, bg="#181818")
         row_qty_lead.pack(fill="x", pady=(0, 5))
 
         frame_qty = tk.Frame(row_qty_lead, bg="#181818")
-        frame_qty.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        tk.Label(frame_qty, text="Nombre de Billets :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#181818").pack(anchor="w")
-        self.combo_qty = ttk.Combobox(frame_qty, values=["1", "2", "3", "4"], width=6, state="readonly")
+        frame_qty.pack(side="left", padx=(0, 4))
+        tk.Label(frame_qty, text="Billets :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#181818").pack(anchor="w")
+        self.combo_qty = ttk.Combobox(frame_qty, values=["1", "2", "3", "4"], width=4, state="readonly")
         self.combo_qty.set("2")
         self.combo_qty.pack(anchor="w", pady=2)
 
         frame_lead = tk.Frame(row_qty_lead, bg="#181818")
-        frame_lead.pack(side="left", fill="x", expand=True, padx=(4, 0))
-        tk.Label(frame_lead, text="Avance Firing (Lead Time ms) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#181818").pack(anchor="w")
-        self.entry_lead = tk.Entry(frame_lead, font=("Segoe UI", 9), bg="#262626", fg="#FFFFFF", insertbackground="white", width=10)
+        frame_lead.pack(side="left", padx=(4, 4))
+        tk.Label(frame_lead, text="Avance (ms) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#181818").pack(anchor="w")
+        self.entry_lead = tk.Entry(frame_lead, font=("Segoe UI", 9), bg="#262626", fg="#FFFFFF", insertbackground="white", width=8)
         self.entry_lead.insert(0, "35.0")
         self.entry_lead.pack(anchor="w", pady=2)
+
+        frame_time = tk.Frame(row_qty_lead, bg="#181818")
+        frame_time.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        tk.Label(frame_time, text="Heure Drop T0 (ex: 10:00:00) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#181818").pack(anchor="w")
+        self.entry_drop_time = tk.Entry(frame_time, font=("Segoe UI", 9), bg="#262626", fg="#FFFFFF", insertbackground="white")
+        self.entry_drop_time.insert(0, "")
+        self.entry_drop_time.pack(fill="x", pady=2)
 
         # Session Auth / Cookie
         row_auth = tk.Frame(form_frame, bg="#181818")
@@ -515,6 +620,23 @@ class BilletterieSniperApp:
         self.entry_ntfy = tk.Entry(frame_nt, font=("Segoe UI", 8), bg="#262626", fg="#FFFFFF", insertbackground="white")
         self.entry_ntfy.insert(0, "")
         self.entry_ntfy.pack(fill="x", pady=2)
+
+        # Option Anti-WAF Chrome Natif
+        row_opts = tk.Frame(form_frame, bg="#181818")
+        row_opts.pack(fill="x", pady=(0, 4))
+        self.var_chrome_mode = tk.BooleanVar(value=False)
+        self.chk_chrome = tk.Checkbutton(
+            row_opts,
+            text="🛡️ Mode Chrome Natif (Anti-WAF / Parité TLS 100% in-browser)",
+            variable=self.var_chrome_mode,
+            font=("Segoe UI", 8, "bold"),
+            fg="#64B5F6",
+            bg="#181818",
+            selectcolor="#262626",
+            activebackground="#181818",
+            activeforeground="#64B5F6",
+        )
+        self.chk_chrome.pack(side="left")
 
         # Action Buttons
         btn_frame = tk.Frame(form_frame, bg="#181818", pady=6)
@@ -687,15 +809,91 @@ class BilletterieSniperApp:
         self.text_log.insert("end", f"[{timestamp}] {message}\n")
         self.text_log.see("end")
 
+    def _on_preset_selected(self, event=None):
+        name = self.combo_preset.get()
+        preset = PLATFORM_PRESETS.get(name)
+        if preset:
+            self.entry_url.delete(0, "end")
+            self.entry_url.insert(0, preset["url"])
+            self.entry_event_id.delete(0, "end")
+            self.entry_event_id.insert(0, preset["event_id"])
+            self.entry_cat.delete(0, "end")
+            self.entry_cat.insert(0, preset["categories"])
+            self.log(f"[PRESET] Configuration chargée pour : {name}")
+
+    def _save_settings(self):
+        try:
+            settings = {
+                "preset": self.combo_preset.get(),
+                "url": self.entry_url.get().strip(),
+                "event_id": self.entry_event_id.get().strip(),
+                "category": self.entry_cat.get().strip(),
+                "quantity": self.combo_qty.get(),
+                "lead_time": self.entry_lead.get().strip(),
+                "drop_time": self.entry_drop_time.get().strip(),
+                "cookie": self.entry_cookie.get().strip(),
+                "ntfy": self.entry_ntfy.get().strip(),
+                "chrome_mode": self.var_chrome_mode.get(),
+            }
+            os.makedirs(os.path.dirname(GUI_SETTINGS_PATH), exist_ok=True)
+            with open(GUI_SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2)
+        except Exception:
+            pass
+
+    def _load_settings(self):
+        if not os.path.isfile(GUI_SETTINGS_PATH):
+            return
+        try:
+            with open(GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                s = json.load(f)
+            if "preset" in s and s["preset"] in PLATFORM_PRESETS:
+                self.combo_preset.set(s["preset"])
+            if "url" in s:
+                self.entry_url.delete(0, "end")
+                self.entry_url.insert(0, s["url"])
+            if "event_id" in s:
+                self.entry_event_id.delete(0, "end")
+                self.entry_event_id.insert(0, s["event_id"])
+            if "category" in s:
+                self.entry_cat.delete(0, "end")
+                self.entry_cat.insert(0, s["category"])
+            if "quantity" in s:
+                self.combo_qty.set(s["quantity"])
+            if "lead_time" in s:
+                self.entry_lead.delete(0, "end")
+                self.entry_lead.insert(0, s["lead_time"])
+            if "drop_time" in s:
+                self.entry_drop_time.delete(0, "end")
+                self.entry_drop_time.insert(0, s["drop_time"])
+            if "cookie" in s:
+                self.entry_cookie.delete(0, "end")
+                self.entry_cookie.insert(0, s["cookie"])
+            if "ntfy" in s:
+                self.entry_ntfy.delete(0, "end")
+                self.entry_ntfy.insert(0, s["ntfy"])
+            if "chrome_mode" in s:
+                self.var_chrome_mode.set(s["chrome_mode"])
+        except Exception:
+            pass
+
+    def _on_close(self):
+        self._save_settings()
+        self.root.destroy()
+
     def _on_arm(self):
         url = self.entry_url.get().strip()
         event_id = self.entry_event_id.get().strip()
         cat = self.entry_cat.get().strip()
         qty = int(self.combo_qty.get().strip() or "1")
         lead = float(self.entry_lead.get().strip() or "35.0")
+        drop_time_str = self.entry_drop_time.get().strip()
+        drop_utc = parse_drop_time_str(drop_time_str)
         cookie = self.entry_cookie.get().strip()
         ntfy = self.entry_ntfy.get().strip()
+        use_chrome = self.var_chrome_mode.get()
 
+        self._save_settings()
         self.worker.ntfy_topic = ntfy if ntfy else None
         self.status_badge.configure(text="PRÉ-CHAUFFE...", fg="#FFD600", bg="#37474F")
         self.worker.run_coro(
@@ -705,7 +903,9 @@ class BilletterieSniperApp:
                 category_id=cat,
                 quantity=qty,
                 lead_time_ms=lead,
+                drop_time_utc=drop_utc,
                 session_cookie=cookie,
+                use_chrome=use_chrome,
             )
         )
 
@@ -811,7 +1011,7 @@ class BilletterieSniperApp:
         best = self.worker.lottery_selector.best_ticket()
         if best:
             self._on_apply_best_ip()
-            self.log("[AUTOPILOTE] ⚡ Enchaînement automatique : Armement de la socket HTTP/2...")
+            self.log("[AUTOPILOTE] ⚡ Enchaînement automatique : Armement de la session gagnante...")
             self._on_arm()
             self.root.after(350, self._on_fire)
 
@@ -821,8 +1021,13 @@ class BilletterieSniperApp:
         cat = self.entry_cat.get().strip()
         qty = int(self.combo_qty.get().strip() or "1")
         lead = float(self.entry_lead.get().strip() or "35.0")
+        drop_time_str = self.entry_drop_time.get().strip()
+        drop_utc = parse_drop_time_str(drop_time_str)
+        cookie = self.entry_cookie.get().strip()
         ntfy = self.entry_ntfy.get().strip()
+        use_chrome = self.var_chrome_mode.get()
 
+        self._save_settings()
         sample_20 = [f"192.168.10.{i}" for i in range(1, 21)]
         golden = int(self.entry_golden.get().strip() or "500")
 
@@ -839,7 +1044,9 @@ class BilletterieSniperApp:
                 lead_time_ms=lead,
                 ip_list=sample_20,
                 golden_threshold=golden,
+                drop_time_utc=drop_utc,
                 ntfy_topic=ntfy if ntfy else None,
+                use_chrome=use_chrome,
             )
         )
 
