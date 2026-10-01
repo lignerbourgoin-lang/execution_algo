@@ -1,0 +1,33 @@
+{
+  "task_name": "Billetterie - Drop & Réservation de Places",
+  "ticket": {
+    "platform_name": "Custom / Billetterie",
+    "target_url": "https://billetterie.example.com",
+    "reserve_endpoint": "/api/events/CONCERT-2026/reserve",
+    "availability_endpoint": "/api/events/CONCERT-2026/availability",
+    "event_id": "CONCERT-2026",
+    "category_id": "CARRE_OR",
+    "quantity": 2,
+    "max_price_per_ticket": 120.0
+  },
+  "drop_timing": {
+    "mode": "scheduled",
+    "drop_time_iso": "2026-10-15T10:00:00Z",
+    "lead_time_ms": 35.0,
+    "ntp_sync_enabled": true
+  },
+  "session_auth": {
+    "auth_token": "VOTRE_TOKEN_BEARER_OU_VIDE",
+    "session_cookies": {
+      "session_id": "VOTRE_SESSION_COOKIE"
+    }
+  },
+  "post_reservation": {
+    "auto_open_browser": true,
+    "cart_release_sniper": {
+      "enabled": true,
+      "poll_interval_sec": 0.5,
+      "duration_minutes": 15
+    }
+  }
+}
