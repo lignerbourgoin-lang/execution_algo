@@ -1,22 +1,26 @@
 """
 Asynchronous Checkout State Machine
 -----------------------------------
-Manages the fast sequential stages of an inventory reservation & checkout pipeline:
-- Thread-safe & stateless per execution (no shared state between concurrent calls).
-- Mandatory Idempotency-Key (UUIDv4) to guarantee zero duplicate charges or orders.
-- Strict response validation (zero simulated tokens: fails explicitly if server returns non-JSON or missing token).
+Manages the sequential stages of an inventory reservation & checkout pipeline:
+- Pre-builds the user profile payload (addresses, payment tokens) in memory.
+- Transitions through states (IDLE -> ARMED -> RESERVING -> RESERVED -> SUBMITTING_DETAILS -> COMPLETED).
+- Single-flight: one checkout at a time per machine, and no second purchase after a success.
 """
 
-from dataclasses import dataclass
-from enum import Enum, auto
-import json
-import time
-from typing import Any, Dict, Optional
+import asyncio
+import logging
 import uuid
+from enum import Enum, auto
+from typing import Any, Dict, Optional
 
 from core.engine.base import BaseExecutor, ExecutionResult, Signal
 from core.network.persistent_client import PrewarmedHttpClient
 from core.telemetry.tracker import LatencyTracker
+
+logger = logging.getLogger("modules.retail.checkout")
+
+METHODS_WITH_BODY = frozenset({"POST", "PUT", "PATCH"})
+DEFAULT_TOKEN_FIELD = "token"
 
 
 class CheckoutState(Enum):
@@ -30,18 +34,8 @@ class CheckoutState(Enum):
     FAILED = auto()
 
 
-@dataclass
-class ExecutionContext:
-    """Per-execution context avoiding state collisions between concurrent tasks."""
-    action_id: str
-    idempotency_key: str
-    state: CheckoutState = CheckoutState.IDLE
-    reservation_token: Optional[str] = None
-    error: Optional[str] = None
-
-
 class CheckoutProfile:
-    """Stores pre-serialized payloads to eliminate JSON serialization during execution."""
+    """Holds the shipping payload built once, outside of the critical path."""
 
     def __init__(
         self,
@@ -52,8 +46,7 @@ class CheckoutProfile:
         self.email = email
         self.shipping_address = shipping_address
         self.payment_token = payment_token
-        # Pre-serialized dictionary for immediate reuse
-        self.preserialized_shipping = {
+        self.preserialized_shipping: Dict[str, Any] = {
             "email": email,
             "shipping_address": shipping_address,
         }
@@ -61,9 +54,18 @@ class CheckoutProfile:
             self.preserialized_shipping["payment_token"] = payment_token
 
 
+def _is_success_status(status_code: int) -> bool:
+    return 200 <= status_code < 300
+
+
 class FastCheckoutStateMachine(BaseExecutor):
     """
-    Stateless transaction executor operating over pre-warmed HTTP sockets.
+    Executes transaction sequences over pre-warmed HTTP sockets.
+
+    Signal payload keys:
+      item_id, quantity, reserve_endpoint, reserve_method, shipping_endpoint, shipping_method,
+      token_field (default "token"), require_reservation_token (default True),
+      idempotency_key (optional: pass the same key when retrying the same purchase).
     """
 
     def __init__(
@@ -77,118 +79,136 @@ class FastCheckoutStateMachine(BaseExecutor):
         self.client = http_client
         self.profile = profile
         self.telemetry = telemetry or LatencyTracker()
-        self.is_armed = False
+        self.state = CheckoutState.IDLE
+        self.reservation_token: Optional[str] = None
+        self._execution_lock = asyncio.Lock()
 
     async def initialize(self):
-        """Pre-warm connection and set armed status."""
+        """Pre-warm connection and enter ARMED state."""
         await self.client.start()
-        self.is_armed = True
+        self.state = CheckoutState.ARMED
+
+    def reset(self):
+        """Explicitly re-arms the machine after a COMPLETED purchase (operator decision only)."""
+        self.state = CheckoutState.ARMED
+        self.reservation_token = None
+
+    def _rejected(self, action_id: str, error: str) -> ExecutionResult:
+        logger.warning("Checkout %s rejected: %s", action_id, error)
+        return ExecutionResult(action_id=action_id, success=False, status_code=0, data={}, latency_ms=0.0, error=error)
 
     async def execute(self, signal: Signal) -> ExecutionResult:
-        """
-        Executes a reservation flow in an isolated, stateless execution context.
-        """
-        # Create an isolated execution context for this specific run
+        """Executes the reservation then shipping steps upon a trigger signal."""
         action_id = f"checkout_{signal.target_id}_{uuid.uuid4().hex[:8]}"
-        idempotency_key = signal.payload.get("idempotency_key") or str(uuid.uuid4())
 
-        ctx = ExecutionContext(
-            action_id=action_id,
-            idempotency_key=idempotency_key,
-            state=CheckoutState.RESERVING,
-        )
+        # [FEATURE: CHECKOUT_SINGLE_FLIGHT] Concurrent or repeated triggers never buy twice.
+        # Raison: the orchestrator fires one task per signal; two signals for the same drop
+        #         used to run two full checkouts in parallel and clobber the shared state.
+        # Attention: a second trigger is REJECTED, not queued (a queued run after a success
+        #            is a double purchase). After COMPLETED, only reset() re-arms the machine.
+        if self._execution_lock.locked():
+            return self._rejected(action_id, "Checkout already in flight")
+        if self.state == CheckoutState.COMPLETED:
+            return self._rejected(action_id, "Checkout already completed; call reset() to buy again")
+
+        async with self._execution_lock:
+            return await self._run_checkout(signal, action_id)
+
+    async def _run_checkout(self, signal: Signal, action_id: str) -> ExecutionResult:
+        payload = signal.payload
+        idempotency_key = payload.get("idempotency_key") or str(uuid.uuid4())
+        token_field = payload.get("token_field", DEFAULT_TOKEN_FIELD)
+        require_reservation_token = payload.get("require_reservation_token", True)
 
         trace = self.telemetry.start_trace(
-            action_id=ctx.action_id,
+            action_id=action_id,
             target=self.target_domain,
-            item_id=signal.payload.get("item_id"),
-            idempotency_key=ctx.idempotency_key,
+            item_id=payload.get("item_id"),
+            idempotency_key=idempotency_key,
         )
+        self.state = CheckoutState.RESERVING
+        self.reservation_token = None
+
+        def fail(error: str, status_code: int, data: Dict[str, Any]) -> ExecutionResult:
+            self.state = CheckoutState.FAILED
+            trace.complete(success=False, error=error)
+            logger.warning("Checkout %s failed: %s", action_id, error)
+            return ExecutionResult(
+                action_id=action_id,
+                success=False,
+                status_code=status_code,
+                data=data,
+                latency_ms=trace.total_latency_ms,
+                error=error,
+            )
 
         # Step 1: Reserve Item / Add to Cart
-        reserve_method = signal.payload.get("reserve_method", "POST")
-        reserve_res = await self.client.execute_fast(
+        reserve_method = payload.get("reserve_method", "POST").upper()
+        reserve_response = await self.client.execute_fast(
             method=reserve_method,
-            endpoint=signal.payload.get("reserve_endpoint", "/api/cart/add"),
-            action_id=f"{ctx.action_id}_reserve",
-            json_data={
-                "item_id": signal.payload.get("item_id"),
-                "quantity": signal.payload.get("quantity", 1),
-            } if reserve_method == "POST" else None,
-            idempotency_key=f"{ctx.idempotency_key}_reserve",
+            endpoint=payload.get("reserve_endpoint", "/api/cart/add"),
+            action_id=f"{action_id}_reserve",
+            json_data={"item_id": payload.get("item_id"), "quantity": payload.get("quantity", 1)}
+            if reserve_method in METHODS_WITH_BODY
+            else None,
+            idempotency_key=f"{idempotency_key}-reserve",
         )
         trace.mark_stage("item_reservation_ack")
 
-        # Strict validation: must be 200 or 201
-        if reserve_res.get("status_code") not in (200, 201):
-            ctx.state = CheckoutState.FAILED
-            ctx.error = f"Reservation failed with HTTP {reserve_res.get('status_code')}"
-            trace.complete(success=False, error=ctx.error)
-            return ExecutionResult(
-                action_id=ctx.action_id,
-                success=False,
-                status_code=reserve_res.get("status_code", 0),
-                data=reserve_res,
-                latency_ms=trace.total_latency_ms,
-                error=ctx.error,
-            )
+        reserve_status = reserve_response.get("status_code", 0)
+        if not _is_success_status(reserve_status):
+            return fail(f"Reservation failed with HTTP {reserve_status}", reserve_status, reserve_response)
 
-        # Strict token extraction: NO fake/simulated fallback
-        body = reserve_res.get("body")
-        token = None
-        if isinstance(body, dict):
-            token = body.get("token") or body.get("cart_id") or body.get("id") or body.get("reservation_token")
+        # [FEATURE: NO_SIMULATED_TOKEN] The reservation token is read from the response, never invented.
+        # Raison: the old fallback "tok_simulated" turned a non-JSON answer into a fake success.
+        # Attention: cookie-based carts return no token; set require_reservation_token=False for them.
+        reserve_body = reserve_response.get("body")
+        reservation_token = reserve_body.get(token_field) if isinstance(reserve_body, dict) else None
+        if reservation_token is None and require_reservation_token:
+            return fail(f"Reservation response has no '{token_field}' field", reserve_status, reserve_response)
 
-        if not token:
-            ctx.state = CheckoutState.FAILED
-            ctx.error = "Server response missing reservation token or cart ID"
-            trace.complete(success=False, error=ctx.error)
-            return ExecutionResult(
-                action_id=ctx.action_id,
-                success=False,
-                status_code=reserve_res.get("status_code", 200),
-                data=reserve_res,
-                latency_ms=trace.total_latency_ms,
-                error=ctx.error,
-            )
+        self.state = CheckoutState.RESERVED
+        self.reservation_token = str(reservation_token) if reservation_token is not None else None
 
-        ctx.state = CheckoutState.RESERVED
-        ctx.reservation_token = str(token)
-
-        # Step 2: Inject shipping details
-        ctx.state = CheckoutState.SUBMITTING_DETAILS
+        # Step 2: Submit the pre-built shipping details
+        self.state = CheckoutState.SUBMITTING_DETAILS
         shipping_payload = dict(self.profile.preserialized_shipping)
-        shipping_payload["token"] = ctx.reservation_token
+        if self.reservation_token is not None:
+            shipping_payload[token_field] = self.reservation_token
 
-        shipping_method = signal.payload.get("shipping_method", "POST")
-        shipping_res = await self.client.execute_fast(
+        shipping_method = payload.get("shipping_method", "POST").upper()
+        shipping_response = await self.client.execute_fast(
             method=shipping_method,
-            endpoint=signal.payload.get("shipping_endpoint", "/api/checkout/shipping"),
-            action_id=f"{ctx.action_id}_shipping",
-            json_data=shipping_payload if shipping_method == "POST" else None,
-            idempotency_key=f"{ctx.idempotency_key}_shipping",
+            endpoint=payload.get("shipping_endpoint", "/api/checkout/shipping"),
+            action_id=f"{action_id}_shipping",
+            json_data=shipping_payload if shipping_method in METHODS_WITH_BODY else None,
+            idempotency_key=f"{idempotency_key}-shipping",
         )
         trace.mark_stage("shipping_submitted_ack")
 
-        is_success = (shipping_res.get("status_code") in (200, 201))
-        ctx.state = CheckoutState.COMPLETED if is_success else CheckoutState.FAILED
-        err_msg = None if is_success else f"Shipping step returned HTTP {shipping_res.get('status_code')}"
-        trace.complete(success=is_success, error=err_msg)
+        shipping_status = shipping_response.get("status_code", 0)
+        if not _is_success_status(shipping_status):
+            return fail(
+                f"Shipping step returned HTTP {shipping_status}",
+                shipping_status,
+                {"reservation": reserve_body, "shipping": shipping_response},
+            )
 
+        self.state = CheckoutState.COMPLETED
+        trace.complete(success=True)
         return ExecutionResult(
-            action_id=ctx.action_id,
-            success=is_success,
-            status_code=shipping_res.get("status_code", 0),
+            action_id=action_id,
+            success=True,
+            status_code=shipping_status,
             data={
-                "reservation": reserve_res.get("body"),
-                "shipping": shipping_res.get("body"),
-                "token": ctx.reservation_token,
+                "reservation": reserve_body,
+                "shipping": shipping_response.get("body"),
+                "idempotency_key": idempotency_key,
                 "stages": trace.get_breakdown(),
             },
             latency_ms=trace.total_latency_ms,
-            error=err_msg,
         )
 
     async def shutdown(self):
-        self.is_armed = False
+        self.state = CheckoutState.IDLE
         await self.client.close()

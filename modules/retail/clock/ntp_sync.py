@@ -2,31 +2,77 @@
 NTP Time Synchronization & Sub-Millisecond Scheduler
 ----------------------------------------------------
 Provides:
-1. NtpClient: High-precision RFC 5905 SNTP client measuring local clock drift/offset.
-2. HighPrecisionScheduler: Hybrid (async sleep + spin-wait) scheduler for T0 target execution.
+1. NtpClient: RFC 5905 SNTP client measuring local clock offset AND its uncertainty.
+2. HighPrecisionScheduler: Hybrid (async sleep + bounded spin-wait) scheduler for T0 target execution.
+
+Honest precision note: the scheduler dispatches within a few microseconds of the LOCAL target,
+but the true error versus the remote server clock is bounded by the NTP uncertainty
+(round-trip / 2 of the best sample, typically 1 to 20 ms). Both numbers are reported.
 """
 
 import asyncio
+import logging
 import socket
 import struct
-import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import Any, Dict, List, Optional
+
+from core.system import high_resolution_timer
+
+logger = logging.getLogger("modules.retail.clock")
 
 # NTP epoch starts at Jan 1 1900, Unix epoch starts at Jan 1 1970
-# Difference in seconds between 1900 and 1970 (including leap years)
-NTP_DELTA = 2208988800
+NTP_EPOCH_DELTA_SEC = 2208988800
+NTP_FRACTION_SCALE = 2**32
+NTP_PACKET_SIZE = 48
+NTP_PORT = 123
+NTP_CLIENT_HEADER_BYTE = 0x23  # LI = 0, VN = 4, Mode = 3 (client)
+NTP_MODE_SERVER = 4
+NTP_LEAP_UNSYNCHRONIZED = 3
+NTP_STRATUM_KISS_OF_DEATH = 0
+NTP_MAX_ACCEPTED_RTT_MS = 1500.0
+
+# [FEATURE: THREE_PHASE_WAIT] coarse sleep -> cooperative yield-spin -> bounded hard spin.
+# Raison: measured on Windows (2026-10-01, 1ms timer active): asyncio.sleep overshoot is
+#         p50 1.9 ms but p99 65 ms / max 86 ms under load. A fixed 4 ms spin window fired late.
+# Attention: during the yield phase the loop keeps running other tasks (heartbeats) but one
+#            core is busy for up to COARSE_SLEEP_MARGIN_MS; only the last HARD_SPIN_WINDOW_MS
+#            blocks the loop. A task hogging the loop during the yield phase delays T0.
+COARSE_SLEEP_MARGIN_MS = 100.0
+HARD_SPIN_WINDOW_MS = 1.0
+NS_PER_MS = 1_000_000
+NS_PER_SEC = 1_000_000_000
+
+
+class ClockSyncError(RuntimeError):
+    """Raised when no NTP server gives a usable answer (fail-closed scheduling)."""
 
 
 @dataclass
 class NtpSyncResult:
     server: str
-    offset_ms: float       # Difference: (Atomic Time - Local Time) in ms
-    round_trip_ms: float   # Network RTT to NTP server
+    offset_ms: float  # (Atomic Time - Local Time) in ms
+    round_trip_ms: float  # Network RTT to NTP server
     stratum: int
     precision: float
-    synced_at_local: float # Local time.time() when sync completed
+    synced_at_local: float  # Local time.time() when sync completed
+
+    @property
+    def uncertainty_ms(self) -> float:
+        """Maximum offset error for this sample: half the round trip (asymmetric path worst case)."""
+        return self.round_trip_ms / 2.0
+
+
+def _to_ntp_timestamp(unix_seconds: float) -> tuple[int, int]:
+    ntp_seconds = unix_seconds + NTP_EPOCH_DELTA_SEC
+    integer_part = int(ntp_seconds)
+    fraction_part = int((ntp_seconds - integer_part) * NTP_FRACTION_SCALE)
+    return integer_part, fraction_part
+
+
+def _from_ntp_timestamp(integer_part: int, fraction_part: int) -> float:
+    return integer_part - NTP_EPOCH_DELTA_SEC + fraction_part / float(NTP_FRACTION_SCALE)
 
 
 class NtpClient:
@@ -41,90 +87,112 @@ class NtpClient:
         "pool.ntp.org",
     ]
 
-    def __init__(self, timeout: float = 2.0):
+    def __init__(self, timeout: float = 2.0, port: int = NTP_PORT):
         self.timeout = timeout
+        self.port = port
         self.cached_offset_ms: float = 0.0
+        self.cached_uncertainty_ms: Optional[float] = None
         self.last_sync_time: float = 0.0
 
-    def query_server(self, host: str, port: int = 123) -> Optional[NtpSyncResult]:
+    @property
+    def is_synced(self) -> bool:
+        return self.cached_uncertainty_ms is not None
+
+    def query_server(self, host: str, port: Optional[int] = None) -> Optional[NtpSyncResult]:
         """
         Sends an SNTP query to the given server and calculates offset and delay.
+        Returns None (and logs why) on any invalid or unusable answer.
         """
-        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        client.settimeout(self.timeout)
-
-        # RFC 5905: LI = 0, VN = 4 (NTPv4), Mode = 3 (Client) -> 0x23
-        msg = b"\x23" + 47 * b"\0"
+        port = port or self.port
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.settimeout(self.timeout)
 
         try:
-            # T1: Client transmit time
-            t1 = time.time()
-            t1_perf = time.perf_counter_ns()
-            client.sendto(msg, (host, port))
+            # [FEATURE: NTP_MONOTONIC_RTT] T4 is derived from T1 + monotonic elapsed time.
+            # Raison: two time.time() reads can jump if the OS clock is adjusted mid-query.
+            # Attention: the originate timestamp check rejects stale or spoofed replies.
+            send_wall_time = time.time()
+            send_perf_ns = time.perf_counter_ns()
+            transmit_seconds, transmit_fraction = _to_ntp_timestamp(send_wall_time)
+            request_packet = bytes([NTP_CLIENT_HEADER_BYTE]) + bytes(39) + struct.pack(
+                "!II", transmit_seconds, transmit_fraction
+            )
+            udp_socket.sendto(request_packet, (host, port))
 
-            data, _ = client.recvfrom(1024)
-            # T4: Client receive time
-            t4_perf = time.perf_counter_ns()
-            t4 = time.time()
+            response_packet, _ = udp_socket.recvfrom(1024)
+            receive_perf_ns = time.perf_counter_ns()
+            receive_wall_time = send_wall_time + (receive_perf_ns - send_perf_ns) / NS_PER_SEC
 
-            if len(data) < 48:
+            if len(response_packet) < NTP_PACKET_SIZE:
+                logger.warning("NTP %s: short packet (%d bytes)", host, len(response_packet))
                 return None
 
-            unpacked = struct.unpack("!BBBb11I", data[:48])
-            stratum = unpacked[1]
-            precision = unpacked[3]
+            unpacked = struct.unpack("!BBBb11I", response_packet[:NTP_PACKET_SIZE])
+            header_byte, stratum, precision = unpacked[0], unpacked[1], unpacked[3]
+            leap_indicator = header_byte >> 6
+            mode = header_byte & 0x7
 
-            # T2: Server receive time (offset 32..40 -> indices 11, 12)
-            t2_sec = unpacked[11] - NTP_DELTA
-            t2_frac = unpacked[12] / float(2**32)
-            t2 = t2_sec + t2_frac
+            if mode != NTP_MODE_SERVER:
+                logger.warning("NTP %s: unexpected mode %d", host, mode)
+                return None
+            if stratum == NTP_STRATUM_KISS_OF_DEATH or leap_indicator == NTP_LEAP_UNSYNCHRONIZED:
+                logger.warning("NTP %s: server unsynchronized or rate-limiting (stratum=%d)", host, stratum)
+                return None
+            if (unpacked[9], unpacked[10]) != (transmit_seconds, transmit_fraction):
+                logger.warning("NTP %s: originate timestamp mismatch, reply discarded", host)
+                return None
 
-            # T3: Server transmit time (offset 40..48 -> indices 13, 14)
-            t3_sec = unpacked[13] - NTP_DELTA
-            t3_frac = unpacked[14] / float(2**32)
-            t3 = t3_sec + t3_frac
+            server_receive_time = _from_ntp_timestamp(unpacked[11], unpacked[12])
+            server_transmit_time = _from_ntp_timestamp(unpacked[13], unpacked[14])
 
-            # Calculate network round-trip and clock offset
-            rtt_sec = (t4 - t1) - (t3 - t2)
-            offset_sec = ((t2 - t1) + (t3 - t4)) / 2.0
+            round_trip_sec = (receive_wall_time - send_wall_time) - (server_transmit_time - server_receive_time)
+            offset_sec = ((server_receive_time - send_wall_time) + (server_transmit_time - receive_wall_time)) / 2.0
 
             return NtpSyncResult(
                 server=host,
                 offset_ms=offset_sec * 1000.0,
-                round_trip_ms=max(0.0, rtt_sec * 1000.0),
+                round_trip_ms=max(0.0, round_trip_sec * 1000.0),
                 stratum=stratum,
                 precision=float(precision),
-                synced_at_local=t4,
+                synced_at_local=receive_wall_time,
             )
 
-        except Exception:
+        except OSError as error:
+            logger.warning("NTP %s: query failed: %s", host, error)
             return None
         finally:
-            client.close()
+            udp_socket.close()
 
     def _process_results(self, results: List[NtpSyncResult]) -> Dict[str, Any]:
         if not results:
-            return {
-                "success": False,
-                "error": "All NTP queries failed",
-                "offset_ms": 0.0,
-            }
+            return {"success": False, "error": "All NTP queries failed", "offset_ms": 0.0}
 
-        # RFC 5905 Clock Filter: discard samples with abnormal RTT (> 1500ms) caused by routing spikes
-        filtered_results = [r for r in results if r.round_trip_ms < 1500.0]
-        candidates = filtered_results if filtered_results else results
+        reliable_results = [r for r in results if r.round_trip_ms < NTP_MAX_ACCEPTED_RTT_MS]
+        if not reliable_results:
+            return {"success": False, "error": "All NTP replies exceeded the RTT limit", "offset_ms": 0.0}
 
-        # Calculate median offset among reliable low-RTT candidates
-        offsets = sorted([r.offset_ms for r in candidates])
-        median_offset = offsets[len(offsets) // 2]
-        self.cached_offset_ms = median_offset
+        # [FEATURE: NTP_MIN_DELAY_SELECTION] Keep the lowest-RTT sample, as the RFC 5905 clock filter does.
+        # Raison: offset error is bounded by RTT / 2, so the fastest reply is the most trustworthy.
+        #         The previous median mixed precise and imprecise samples.
+        # Attention: median_offset_ms is still reported, for diagnostics and GUI compatibility.
+        best_sample = min(reliable_results, key=lambda r: r.round_trip_ms)
+        sorted_offsets = sorted(r.offset_ms for r in reliable_results)
+        median_offset_ms = sorted_offsets[len(sorted_offsets) // 2]
+        offset_spread_ms = sorted_offsets[-1] - sorted_offsets[0]
+
+        self.cached_offset_ms = best_sample.offset_ms
+        self.cached_uncertainty_ms = best_sample.uncertainty_ms
         self.last_sync_time = time.time()
 
         return {
             "success": True,
-            "median_offset_ms": round(median_offset, 3),
+            "offset_ms": round(best_sample.offset_ms, 3),
+            "uncertainty_ms": round(best_sample.uncertainty_ms, 3),
+            "best_server": best_sample.server,
+            "median_offset_ms": round(median_offset_ms, 3),
+            "offset_spread_ms": round(offset_spread_ms, 3),
             "servers_responded": len(results),
-            "reliable_servers": len(candidates),
+            "reliable_servers": len(reliable_results),
             "details": [
                 {
                     "server": r.server,
@@ -137,24 +205,16 @@ class NtpClient:
         }
 
     def sync(self, servers: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Synchronous query of all NTP servers."""
+        """Blocking sequential sync. Do NOT call from inside an event loop; use sync_async()."""
         servers = servers or self.DEFAULT_SERVERS
-        results: List[NtpSyncResult] = []
-        for s in servers:
-            res = self.query_server(s)
-            if res:
-                results.append(res)
+        results = [r for r in (self.query_server(s) for s in servers) if r is not None]
         return self._process_results(results)
 
     async def sync_async(self, servers: Optional[List[str]] = None) -> Dict[str, Any]:
-        """
-        Asynchronously queries all NTP servers in parallel using worker threads,
-        completely non-blocking for the asyncio event loop.
-        """
+        """Queries all servers in parallel worker threads, without blocking the event loop."""
         servers = servers or self.DEFAULT_SERVERS
-        tasks = [asyncio.to_thread(self.query_server, s) for s in servers]
-        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-        results = [r for r in raw_results if isinstance(r, NtpSyncResult)]
+        raw_results = await asyncio.gather(*(asyncio.to_thread(self.query_server, s) for s in servers))
+        results = [r for r in raw_results if r is not None]
         return self._process_results(results)
 
     def get_atomic_time(self) -> float:
@@ -165,7 +225,9 @@ class NtpClient:
 class HighPrecisionScheduler:
     """
     Schedules execution at exact atomic UTC timestamps.
-    Uses cooperative async sleep with boosted OS timer resolution to avoid CPU freezing.
+    Coarse asyncio.sleep until COARSE_SLEEP_MARGIN_MS before target, then a cooperative
+    yield-spin (asyncio.sleep(0)), then a hard spin for the last HARD_SPIN_WINDOW_MS.
+    The event loop is blocked at most HARD_SPIN_WINDOW_MS per call.
     """
 
     def __init__(self, ntp_client: Optional[NtpClient] = None):
@@ -175,53 +237,51 @@ class HighPrecisionScheduler:
         self,
         target_atomic_timestamp_utc: float,
         latency_advance_ms: float = 0.0,
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Any]:
         """
-        Waits until the exact target timestamp cooperatively without blocking the loop.
-        :param target_atomic_timestamp_utc: True UTC timestamp when target event occurs.
+        Waits until the target timestamp minus latency_advance_ms.
+        :param target_atomic_timestamp_utc: True UTC timestamp (Unix seconds) of the event.
         :param latency_advance_ms: Network lead time (e.g. RTT / 2) to fire before T0.
-        :return: Metrics describing dispatch accuracy.
+        :return: dispatch_error_us (local precision), clock_uncertainty_ms (true bound), fired_late.
+        :raises ClockSyncError: if the clock was never synced and no NTP server answers.
         """
-        # Ensure NTP sync is performed asynchronously
-        if self.ntp.last_sync_time == 0.0:
-            await self.ntp.sync_async()
+        if not self.ntp.is_synced:
+            sync_result = await self.ntp.sync_async()
+            if not sync_result["success"]:
+                raise ClockSyncError(sync_result["error"])
 
-        # Boost Windows timer resolution from 15.6ms to 1ms
-        is_win = (sys.platform == "win32")
-        if is_win:
-            try:
-                import ctypes
-                ctypes.windll.winmm.timeBeginPeriod(1)
-            except Exception:
+        with high_resolution_timer():
+            clock_offset_ns = int(self.ntp.cached_offset_ms * NS_PER_MS)
+            advance_ns = int(latency_advance_ms * NS_PER_MS)
+            target_local_ns = int(target_atomic_timestamp_utc * NS_PER_SEC) - clock_offset_ns - advance_ns
+
+            coarse_margin_ns = int(COARSE_SLEEP_MARGIN_MS * NS_PER_MS)
+            hard_spin_window_ns = int(HARD_SPIN_WINDOW_MS * NS_PER_MS)
+            remaining_ns = target_local_ns - time.time_ns()
+            if remaining_ns > coarse_margin_ns:
+                await asyncio.sleep((remaining_ns - coarse_margin_ns) / NS_PER_SEC)
+
+            # Translate the wall-clock target into the monotonic clock once, before the fine phases.
+            wall_reference_ns = time.time_ns()
+            perf_reference_ns = time.perf_counter_ns()
+            perf_target_ns = perf_reference_ns + (target_local_ns - wall_reference_ns)
+
+            while perf_target_ns - time.perf_counter_ns() > hard_spin_window_ns:
+                await asyncio.sleep(0)
+            while time.perf_counter_ns() < perf_target_ns:
                 pass
 
-        try:
-            offset_ns = int(self.ntp.cached_offset_ms * 1_000_000)
-            advance_ns = int(latency_advance_ms * 1_000_000)
-            target_atomic_ns = int(target_atomic_timestamp_utc * 1_000_000_000)
+            fired_at_perf_ns = time.perf_counter_ns()
 
-            # Target timestamp on local system clock
-            target_local_ns = target_atomic_ns - offset_ns - advance_ns
+        dispatch_error_us = (fired_at_perf_ns - perf_target_ns) / 1000.0
+        fired_late = perf_target_ns < perf_reference_ns
+        if fired_late:
+            logger.warning("Scheduler fired %.3f ms after target", (perf_reference_ns - perf_target_ns) / NS_PER_MS)
 
-            # Cooperative sleep (does not block other asyncio tasks)
-            now_local_ns = time.time_ns()
-            remaining_ns = target_local_ns - now_local_ns
-
-            if remaining_ns > 0:
-                await asyncio.sleep(remaining_ns / 1_000_000_000.0)
-
-            fired_at_ns = time.time_ns()
-            accuracy_ms = (fired_at_ns - target_local_ns) / 1_000_000.0
-
-            return {
-                "accuracy_ms": round(accuracy_ms, 2),
-                "offset_applied_ms": round(self.ntp.cached_offset_ms, 3),
-                "lead_time_applied_ms": round(latency_advance_ms, 3),
-            }
-        finally:
-            if is_win:
-                try:
-                    import ctypes
-                    ctypes.windll.winmm.timeEndPeriod(1)
-                except Exception:
-                    pass
+        return {
+            "dispatch_error_us": round(dispatch_error_us, 2),
+            "clock_uncertainty_ms": round(self.ntp.cached_uncertainty_ms or 0.0, 3),
+            "fired_late": fired_late,
+            "offset_applied_ms": round(self.ntp.cached_offset_ms, 3),
+            "lead_time_applied_ms": round(latency_advance_ms, 3),
+        }

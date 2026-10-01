@@ -1,0 +1,29 @@
+{
+  "source": {
+    "url": "https://resale.example.com/api/events/EVENT_ID/listings",
+    "items_path": "data.listings",
+    "fields": {
+      "id": "id",
+      "price": "price.amount",
+      "title": "category.name",
+      "url": "url",
+      "quantity": "quantity"
+    },
+    "poll_interval_sec": 5.0,
+    "headers": {}
+  },
+  "filters": {
+    "max_price": 120,
+    "min_quantity": 1,
+    "title_keywords": [],
+    "excluded_keywords": [
+      "PMR"
+    ]
+  },
+  "alert_existing_on_start": true,
+  "notify": {
+    "ntfy_topic": "remplace-par-un-nom-long-et-aleatoire",
+    "ntfy_server": "https://ntfy.sh",
+    "open_browser": true
+  }
+}

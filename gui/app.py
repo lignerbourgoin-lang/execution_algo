@@ -133,6 +133,24 @@ class TicketWorker:
             )
             self.ui_queue.put(("log", f"[!] Vous avez {cart.get('expires_in_sec', 600) / 60:.0f} min pour finaliser le paiement."))
             self.ui_queue.put(("latency", f"{result.latency_ms:.1f} ms"))
+
+            # Send push alert to phone if ntfy topic provided
+            if getattr(self, "ntfy_topic", None):
+                try:
+                    from modules.retail.notify.notifiers import Notification, NtfyNotifier
+                    notifier = NtfyNotifier(topic=self.ntfy_topic)
+                    await notifier.send(
+                        Notification(
+                            title=f"🎟️ Billets Réservés ! [{self.executor.config.category_id}]",
+                            message=f"{self.executor.config.quantity} place(s) au panier. Cliquez vite pour payer !",
+                            url=self.checkout_url,
+                            is_urgent=True,
+                        )
+                    )
+                    await notifier.close()
+                    self.ui_queue.put(("log", "[NTFY] Alerte envoyée sur votre smartphone via ntfy.sh"))
+                except Exception as e:
+                    self.ui_queue.put(("log", f"[NTFY] Note alerte: {e}"))
         else:
             self.ui_queue.put(("status", ("ÉCHEC DU DROP", "#FF1744")))
             self.ui_queue.put(("log", f"[✖] Échec de la réservation : {result.error} (HTTP {result.status_code})"))
@@ -152,6 +170,22 @@ class TicketWorker:
             self.ui_queue.put(("status", ("PANIER RATTRAPÉ !", "#00E676")))
             self.ui_queue.put(("cart_url", self.checkout_url))
             self.ui_queue.put(("log", f"[✔] PLACE RATTRAPÉE DANS UN PANIER EXPIRÉ !"))
+
+            if getattr(self, "ntfy_topic", None):
+                try:
+                    from modules.retail.notify.notifiers import Notification, NtfyNotifier
+                    notifier = NtfyNotifier(topic=self.ntfy_topic)
+                    await notifier.send(
+                        Notification(
+                            title="🎟️ Place Rattrapée !",
+                            message="Panier expiré capturé ! Cliquez pour finaliser la commande.",
+                            url=self.checkout_url,
+                            is_urgent=True,
+                        )
+                    )
+                    await notifier.close()
+                except Exception:
+                    pass
         else:
             self.ui_queue.put(("status", ("AUCUN PANIER", "#B0BEC5")))
             self.ui_queue.put(("log", "[INFO] Fin de la fenêtre de surveillance des paniers."))
@@ -256,10 +290,22 @@ class BilletterieSniperApp:
         self.entry_lead.pack(anchor="w", pady=2)
 
         # Session Auth / Cookie (Optionnel)
-        tk.Label(form_frame, text="Session Cookie / Auth Token (Optionnel si compte connecté) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#1E1E1E").pack(anchor="w")
-        self.entry_cookie = tk.Entry(form_frame, font=("Segoe UI", 8), bg="#2A2A2A", fg="#FFFFFF", insertbackground="white")
+        row_auth = tk.Frame(form_frame, bg="#1E1E1E")
+        row_auth.pack(fill="x", pady=(0, 2))
+
+        frame_ck = tk.Frame(row_auth, bg="#1E1E1E")
+        frame_ck.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        tk.Label(frame_ck, text="Session Cookie (Compte) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#1E1E1E").pack(anchor="w")
+        self.entry_cookie = tk.Entry(frame_ck, font=("Segoe UI", 8), bg="#2A2A2A", fg="#FFFFFF", insertbackground="white")
         self.entry_cookie.insert(0, "")
-        self.entry_cookie.pack(fill="x", pady=(2, 2))
+        self.entry_cookie.pack(fill="x", pady=2)
+
+        frame_nt = tk.Frame(row_auth, bg="#1E1E1E")
+        frame_nt.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        tk.Label(frame_nt, text="Alerte Mobile ntfy.sh (Optionnel) :", font=("Segoe UI", 8), fg="#B0BEC5", bg="#1E1E1E").pack(anchor="w")
+        self.entry_ntfy = tk.Entry(frame_nt, font=("Segoe UI", 8), bg="#2A2A2A", fg="#FFFFFF", insertbackground="white")
+        self.entry_ntfy.insert(0, "")
+        self.entry_ntfy.pack(fill="x", pady=2)
 
         # Action Buttons Grid
         btn_frame = tk.Frame(self.root, bg="#121212")
@@ -355,7 +401,9 @@ class BilletterieSniperApp:
         qty = int(self.combo_qty.get().strip() or "1")
         lead = float(self.entry_lead.get().strip() or "35.0")
         cookie = self.entry_cookie.get().strip()
+        ntfy = self.entry_ntfy.get().strip()
 
+        self.worker.ntfy_topic = ntfy if ntfy else None
         self.status_badge.configure(text="PRÉ-CHAUFFE...", fg="#FFD600", bg="#37474F")
         self.worker.run_coro(
             self.worker.arm_engine(

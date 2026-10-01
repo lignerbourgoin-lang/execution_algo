@@ -3,21 +3,37 @@ Pre-Warmed Persistent HTTP Connection Pool
 ------------------------------------------
 Keeps TLS sockets permanently hot and connected to target hosts.
 Eliminates DNS, TCP 3-way handshake, and TLS negotiation from the execution path.
+HTTP/2 is enabled by default: one multiplexed connection, no head-of-line blocking
+between the heartbeat and the critical request.
 """
 
 import asyncio
+import importlib.util
+import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
+
 import httpx
 
 from core.rate_limiter.limiter import AdaptiveRateLimiter
-from core.telemetry.tracker import ExecutionTrace, LatencyTracker
+from core.telemetry.tracker import LatencyTracker
+
+logger = logging.getLogger("core.network.http")
+
+DEFAULT_USER_AGENT = "ExecutionEngine/2.0"
+DEFAULT_REQUEST_TIMEOUT_SEC = 10.0
+PREWARM_TIMEOUT_SEC = 5.0
+HEARTBEAT_TIMEOUT_SEC = 3.0
+KEEPALIVE_EXPIRY_SEC = 60.0
+MAX_KEEPALIVE_CONNECTIONS = 10
+MAX_CONNECTIONS = 20
+NS_PER_MS = 1_000_000.0
 
 
 class PrewarmedHttpClient:
     """
     Manages persistent HTTP sessions with periodic low-frequency heartbeats
-    to ensure the TLS socket remains alive and ready for zero-latency burst execution.
+    to ensure the TLS socket remains alive and ready for low-latency burst execution.
     """
 
     def __init__(
@@ -27,44 +43,48 @@ class PrewarmedHttpClient:
         rate_limiter: Optional[AdaptiveRateLimiter] = None,
         telemetry: Optional[LatencyTracker] = None,
         headers: Optional[Dict[str, str]] = None,
-        client: Optional[httpx.AsyncClient] = None,
+        http2: bool = True,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.heartbeat_interval_sec = heartbeat_interval_sec
         self.rate_limiter = rate_limiter or AdaptiveRateLimiter(base_rate=10.0, burst_capacity=20.0)
         self.telemetry = telemetry or LatencyTracker()
 
+        # [FEATURE: HTTP2_FAIL_CLOSED] HTTP/2 is requested explicitly and refused loudly if unavailable.
+        # Raison: the README promised HTTP/2 but the client silently spoke HTTP/1.1.
+        #         Silently degrading would hide a latency regression.
+        # Attention: the "Connection: keep-alive" header was removed: it is forbidden in HTTP/2
+        #            (RFC 9113 section 8.2.2) and httpx keeps connections alive by default.
+        if http2 and importlib.util.find_spec("h2") is None:
+            raise RuntimeError("http2=True requires the 'h2' package (pip install -r requirements.txt)")
+
         default_headers = {
-            "User-Agent": "ExecutionEngine/2.0 (HighLatencyOptimized)",
+            "User-Agent": DEFAULT_USER_AGENT,
             "Accept": "application/json, text/plain, */*",
-            "Connection": "keep-alive",
         }
         if headers:
             default_headers.update(headers)
 
-        if client is not None:
-            self.client = client
-        else:
-            # Check HTTP/2 support (h2 package)
-            try:
-                import h2  # noqa: F401
-                has_h2 = True
-            except ImportError:
-                has_h2 = False
-
-            limits = httpx.Limits(max_keepalive_connections=10, max_connections=20, keepalive_expiry=60.0)
-            self.client = httpx.AsyncClient(
-                base_url=self.base_url,
-                http2=has_h2,
-                limits=limits,
-                headers=default_headers,
-                timeout=10.0,
-                verify=True,
-            )
+        limits = httpx.Limits(
+            max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
+            max_connections=MAX_CONNECTIONS,
+            keepalive_expiry=KEEPALIVE_EXPIRY_SEC,
+        )
+        self.client = httpx.AsyncClient(
+            base_url=self.base_url,
+            http2=http2,
+            limits=limits,
+            headers=default_headers,
+            timeout=DEFAULT_REQUEST_TIMEOUT_SEC,
+            verify=True,
+            transport=transport,
+        )
 
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._is_running = False
         self.is_warmed_up = False
+        self.negotiated_http_version: Optional[str] = None
 
     async def start(self):
         """Initializes and pre-warms connection, then starts heartbeat loop."""
@@ -75,27 +95,33 @@ class PrewarmedHttpClient:
     async def prewarm(self) -> bool:
         """Sends an initial probe to complete DNS, TCP and TLS handshakes."""
         try:
-            res = await self.client.head("/", timeout=5.0)
-            self.is_warmed_up = True
-            return True
-        except Exception:
+            response = await self.client.head("/", timeout=PREWARM_TIMEOUT_SEC)
+        except httpx.HTTPError as head_error:
+            logger.info("HEAD prewarm failed (%s), retrying with streamed GET", head_error)
             try:
-                # Some servers disallow HEAD, try GET with stream
-                async with self.client.stream("GET", "/", timeout=5.0) as _:
-                    self.is_warmed_up = True
-                    return True
-            except Exception:
+                async with self.client.stream("GET", "/", timeout=PREWARM_TIMEOUT_SEC) as response:
+                    pass
+            except httpx.HTTPError as get_error:
+                logger.warning("Prewarm failed for %s: %s", self.base_url, get_error)
+                self.is_warmed_up = False
                 return False
+
+        self.negotiated_http_version = response.http_version
+        self.is_warmed_up = True
+        logger.info("Prewarmed %s over %s", self.base_url, self.negotiated_http_version)
+        return True
 
     async def _heartbeat_loop(self):
         """Background loop to keep sockets alive in server/NAT state tables."""
         while self._is_running:
             await asyncio.sleep(self.heartbeat_interval_sec)
             try:
-                await self.client.head("/", timeout=3.0)
-            except Exception:
-                # If connection dropped, next request will reconnect
-                pass
+                await self.client.head("/", timeout=HEARTBEAT_TIMEOUT_SEC)
+                self.is_warmed_up = True
+            except httpx.HTTPError as error:
+                # The next request will reconnect, but the operator must know the socket is cold.
+                self.is_warmed_up = False
+                logger.warning("Heartbeat to %s failed: %s", self.base_url, error)
 
     async def execute_fast(
         self,
@@ -110,68 +136,64 @@ class PrewarmedHttpClient:
         """
         Executes a priority action on the pre-warmed connection with microsecond tracking.
         Supports both json_data and pre-serialized raw bytes.
-        Supports standard Idempotency-Key header to prevent duplicate execution upon retries.
+        Never raises on network errors: returns status_code 0 with an "error" field.
         """
         trace = self.telemetry.start_trace(action_id=action_id, target=f"{self.base_url}{endpoint}")
 
-        # 1. Rate limiter check (wait if penalized)
-        wait_ms = await self.rate_limiter.wait_for_slot()
+        await self.rate_limiter.wait_for_slot()
         trace.mark_stage("rate_limiter_acquired")
 
-        # 2. Dispatch request over warm socket
-        t_dispatch = time.perf_counter_ns()
+        request_headers = dict(headers) if headers else {}
+        if idempotency_key:
+            # Honoured by servers implementing the IETF Idempotency-Key draft; ignored elsewhere.
+            request_headers["Idempotency-Key"] = idempotency_key
+
+        request_kwargs: Dict[str, Any] = {}
+        if content is not None:
+            request_kwargs["content"] = content
+            if not any(name.lower() == "content-type" for name in request_headers):
+                request_headers["Content-Type"] = "application/json"
+        elif json_data is not None:
+            request_kwargs["json"] = json_data
+
+        dispatch_ns = time.perf_counter_ns()
         try:
-            req_kwargs = {}
-            req_headers = dict(headers) if headers else {}
-
-            if idempotency_key:
-                req_headers["Idempotency-Key"] = idempotency_key
-
-            if content is not None:
-                req_kwargs["content"] = content
-                if "Content-Type" not in req_headers and "content-type" not in req_headers:
-                    req_headers["Content-Type"] = "application/json"
-            elif json_data is not None:
-                req_kwargs["json"] = json_data
-
-            res = await self.client.request(
+            response = await self.client.request(
                 method=method,
                 url=endpoint,
-                headers=req_headers if req_headers else None,
-                **req_kwargs,
+                headers=request_headers or None,
+                **request_kwargs,
             )
-            t_recv = time.perf_counter_ns()
-            trace.mark_stage("response_received")
-
-            # 3. Inform rate limiter of server health
-            self.rate_limiter.on_response(res.status_code, dict(res.headers))
-
-            # 4. Parse content
-            content_type = res.headers.get("content-type", "")
-            if "application/json" in content_type:
-                try:
-                    body = res.json()
-                except Exception:
-                    body = res.text
-            else:
-                body = res.text
-
-            trace.complete(success=(res.status_code < 400))
-            return {
-                "status_code": res.status_code,
-                "body": body,
-                "headers": dict(res.headers),
-                "latency_breakdown": trace.get_breakdown(),
-                "network_ms": round((t_recv - t_dispatch) / 1_000_000.0, 3),
-            }
-
-        except Exception as e:
-            trace.complete(success=False, error=str(e))
+        except httpx.HTTPError as error:
+            logger.warning("%s %s%s failed: %r", method, self.base_url, endpoint, error)
+            trace.complete(success=False, error=repr(error))
             return {
                 "status_code": 0,
-                "error": str(e),
+                "error": repr(error),
                 "latency_breakdown": trace.get_breakdown(),
             }
+
+        received_ns = time.perf_counter_ns()
+        trace.mark_stage("response_received")
+        self.rate_limiter.on_response(response.status_code, dict(response.headers))
+
+        content_type = response.headers.get("content-type", "")
+        body: Any = response.text
+        if "application/json" in content_type:
+            try:
+                body = response.json()
+            except ValueError:
+                logger.warning("Invalid JSON body from %s%s despite content-type", self.base_url, endpoint)
+
+        trace.complete(success=(response.status_code < 400))
+        return {
+            "status_code": response.status_code,
+            "body": body,
+            "headers": dict(response.headers),
+            "http_version": response.http_version,
+            "latency_breakdown": trace.get_breakdown(),
+            "network_ms": round((received_ns - dispatch_ns) / NS_PER_MS, 3),
+        }
 
     async def close(self):
         """Clean shutdown of heartbeat and HTTP client session."""

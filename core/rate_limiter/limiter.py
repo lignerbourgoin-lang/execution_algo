@@ -7,9 +7,40 @@ Implements:
 """
 
 import asyncio
+import email.utils
 import random
 import time
 from typing import Any, Dict, Optional
+
+HTTP_TOO_MANY_REQUESTS = 429
+HTTP_SERVICE_UNAVAILABLE = 503
+THROTTLING_STATUS_CODES = (HTTP_TOO_MANY_REQUESTS, HTTP_SERVICE_UNAVAILABLE)
+DEFAULT_PENALTY_MIN_SEC = 1.0
+DEFAULT_PENALTY_MAX_SEC = 3.0
+MAX_RETRY_AFTER_SEC = 300.0
+RATE_CUT_FACTOR = 0.5
+RATE_RECOVERY_FACTOR = 1.1
+SUCCESSES_BEFORE_RECOVERY = 20
+
+
+def parse_retry_after_seconds(retry_after_value: Optional[str]) -> Optional[float]:
+    """
+    Parses a Retry-After header: delta-seconds ("120") or HTTP-date (RFC 9110).
+    Returns None if absent or unparseable. Capped at MAX_RETRY_AFTER_SEC.
+    """
+    if not retry_after_value:
+        return None
+    try:
+        delay_sec = float(retry_after_value)
+    except ValueError:
+        try:
+            retry_at = email.utils.parsedate_to_datetime(retry_after_value)
+        except (TypeError, ValueError):
+            return None
+        if retry_at is None:
+            return None
+        delay_sec = retry_at.timestamp() - time.time()
+    return min(MAX_RETRY_AFTER_SEC, max(0.0, delay_sec))
 
 
 class TokenBucketLimiter:
@@ -105,29 +136,26 @@ class AdaptiveRateLimiter:
         headers = headers or {}
         now_ns = time.perf_counter_ns()
 
-        if status_code == 429:
+        # [FEATURE: ADAPTIVE_BACKOFF_503] 503 is treated like 429, and Retry-After accepts HTTP-dates.
+        # Raison: overloaded ticketing servers answer 503, often with an HTTP-date Retry-After;
+        #         the previous parser fell back to a fixed 2s and ignored 503 entirely.
+        # Attention: penalty is capped at MAX_RETRY_AFTER_SEC to survive absurd header values.
+        if status_code in THROTTLING_STATUS_CODES:
             self.consecutive_successes = 0
-            # Check Retry-After header
-            retry_after = headers.get("retry-after") or headers.get("Retry-After")
-            if retry_after:
-                try:
-                    delay_sec = float(retry_after)
-                except ValueError:
-                    delay_sec = 2.0
-            else:
-                # Jittered exponential penalty
-                delay_sec = random.uniform(1.0, 3.0)
+            retry_after_value = headers.get("retry-after") or headers.get("Retry-After")
+            delay_sec = parse_retry_after_seconds(retry_after_value)
+            if delay_sec is None:
+                delay_sec = random.uniform(DEFAULT_PENALTY_MIN_SEC, DEFAULT_PENALTY_MAX_SEC)
 
-            self.penalty_until_ns = now_ns + int(delay_sec * 1_000_000_000)
+            self.penalty_until_ns = max(self.penalty_until_ns, now_ns + int(delay_sec * 1_000_000_000))
 
-            # Throttle the bucket rate by 50%
-            self.current_rate = max(self.min_rate, self.current_rate * 0.5)
+            self.current_rate = max(self.min_rate, self.current_rate * RATE_CUT_FACTOR)
             self.bucket.rate = self.current_rate
 
         elif 200 <= status_code < 300:
             self.consecutive_successes += 1
             # Gradually restore rate if healthy
-            if self.consecutive_successes > 20 and self.current_rate < self.base_rate:
-                self.current_rate = min(self.base_rate, self.current_rate * 1.1)
+            if self.consecutive_successes > SUCCESSES_BEFORE_RECOVERY and self.current_rate < self.base_rate:
+                self.current_rate = min(self.base_rate, self.current_rate * RATE_RECOVERY_FACTOR)
                 self.bucket.rate = self.current_rate
                 self.consecutive_successes = 0

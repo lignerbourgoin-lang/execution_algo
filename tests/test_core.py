@@ -156,8 +156,8 @@ class TestExecutionOrchestrator(unittest.IsolatedAsyncioTestCase):
 
     async def test_bounded_execution_history(self):
         orchestrator = ExecutionOrchestrator()
-        # Append 1050 mock results directly to execution_history
-        for i in range(1050):
+        maxlen = orchestrator.execution_history.maxlen
+        for i in range(maxlen + 50):
             orchestrator.execution_history.append(
                 ExecutionResult(
                     action_id=f"act_{i}",
@@ -167,11 +167,11 @@ class TestExecutionOrchestrator(unittest.IsolatedAsyncioTestCase):
                     latency_ms=1.0,
                 )
             )
-        # History must not exceed maxlen (1000)
-        self.assertEqual(len(orchestrator.execution_history), 1000)
+        # History must not exceed maxlen
+        self.assertEqual(len(orchestrator.execution_history), maxlen)
         # The oldest elements should have been dropped
         self.assertEqual(orchestrator.execution_history[0].action_id, "act_50")
-        self.assertEqual(orchestrator.execution_history[-1].action_id, "act_1049")
+        self.assertEqual(orchestrator.execution_history[-1].action_id, f"act_{maxlen + 49}")
 
 
 class TestPersistentHttpClient(unittest.IsolatedAsyncioTestCase):
@@ -183,11 +183,11 @@ class TestPersistentHttpClient(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={"status": "confirmed"})
 
         transport = httpx.MockTransport(mock_handler)
-        mock_client = httpx.AsyncClient(transport=transport, base_url="https://api.test.com")
 
         client = PersistentHttpClient(
             base_url="https://api.test.com",
-            client=mock_client,
+            transport=transport,
+            http2=False,
         )
 
         res = await client.execute_fast(

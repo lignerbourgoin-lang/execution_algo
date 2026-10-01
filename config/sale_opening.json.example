@@ -1,0 +1,15 @@
+{
+  "event_name": "Concert exemple",
+  "sale_url": "https://billetterie.example.com/event/EVENT_ID",
+  "opening_time": "2026-10-15T10:00:00+02:00",
+  "reminder_minutes_before": [
+    15,
+    3,
+    0
+  ],
+  "open_browser_minutes_before": 3,
+  "notify": {
+    "ntfy_topic": "remplace-par-un-nom-long-et-aleatoire",
+    "open_browser": false
+  }
+}
