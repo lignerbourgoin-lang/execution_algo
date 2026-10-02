@@ -148,6 +148,7 @@ class TicketWorker:
         drop_time_utc: float | None = None,
         auth_token: str = "",
         session_cookie: str = "",
+        presale_code: str = "",
         use_chrome: bool = False,
     ):
         boost_process_performance()
@@ -192,6 +193,8 @@ class TicketWorker:
 
         if fallback_cats:
             self.ui_queue.put(("log", f"[CONFIG] Catégorie principale: {primary_cat} | Secours: {', '.join(fallback_cats)}"))
+        if presale_code:
+            self.ui_queue.put(("log", f"[CONFIG] Code prévente activé: {presale_code}"))
 
         config = TicketConfig(
             platform_name="billetterie",
@@ -203,6 +206,7 @@ class TicketWorker:
             drop_time_utc=drop_time_utc,
             lead_time_ms=lead_time_ms,
             auth_token=auth_token if auth_token else None,
+            presale_code=presale_code if presale_code else None,
             session_cookies=cookies,
             auto_open_browser=True,
             burst_retries=5,
@@ -395,6 +399,7 @@ class TicketWorker:
         ip_list: list[str],
         golden_threshold: int = 500,
         drop_time_utc: float | None = None,
+        presale_code: str | None = None,
         ntfy_topic: str | None = None,
         use_chrome: bool = False,
     ):
@@ -488,6 +493,7 @@ class TicketWorker:
                 quantity=quantity,
                 drop_time_utc=drop_time_utc,
                 lead_time_ms=lead_time_ms,
+                presale_code=presale_code if presale_code else None,
                 session_cookies={"session_id": f"session_{ticket.ip_address.replace('.', '_')}"},
                 auto_open_browser=True,
                 burst_retries=5,
@@ -768,6 +774,14 @@ class BilletterieSniperApp:
         self.entry_ntfy.insert(0, "")
         self.entry_ntfy.pack(fill="x", pady=2)
 
+        # Code Prévente / Mot de passe
+        row_presale = tk.Frame(form_frame, bg="#181818")
+        row_presale.pack(fill="x", pady=(0, 5))
+        tk.Label(row_presale, text="Code / Mot de passe Prévente (Optionnel) :", font=("Segoe UI", 8), fg="#FFD54F", bg="#181818").pack(anchor="w")
+        self.entry_presale = tk.Entry(row_presale, font=("Segoe UI", 8), bg="#262626", fg="#FFFFFF", insertbackground="white")
+        self.entry_presale.insert(0, "")
+        self.entry_presale.pack(fill="x", pady=2)
+
         # Option Anti-WAF Chrome Natif
         row_opts = tk.Frame(form_frame, bg="#181818")
         row_opts.pack(fill="x", pady=(0, 4))
@@ -979,6 +993,7 @@ class BilletterieSniperApp:
                 "lead_time": self.entry_lead.get().strip(),
                 "drop_time": self.entry_drop_time.get().strip(),
                 "cookie": self.entry_cookie.get().strip(),
+                "presale_code": self.entry_presale.get().strip(),
                 "ntfy": self.entry_ntfy.get().strip(),
                 "chrome_mode": self.var_chrome_mode.get(),
             }
@@ -1016,6 +1031,9 @@ class BilletterieSniperApp:
             if "cookie" in s:
                 self.entry_cookie.delete(0, "end")
                 self.entry_cookie.insert(0, s["cookie"])
+            if "presale_code" in s:
+                self.entry_presale.delete(0, "end")
+                self.entry_presale.insert(0, s["presale_code"])
             if "ntfy" in s:
                 self.entry_ntfy.delete(0, "end")
                 self.entry_ntfy.insert(0, s["ntfy"])
@@ -1037,6 +1055,7 @@ class BilletterieSniperApp:
         drop_time_str = self.entry_drop_time.get().strip()
         drop_utc = parse_drop_time_str(drop_time_str)
         cookie = self.entry_cookie.get().strip()
+        presale = self.entry_presale.get().strip()
         ntfy = self.entry_ntfy.get().strip()
         use_chrome = self.var_chrome_mode.get()
 
@@ -1052,6 +1071,7 @@ class BilletterieSniperApp:
                 lead_time_ms=lead,
                 drop_time_utc=drop_utc,
                 session_cookie=cookie,
+                presale_code=presale,
                 use_chrome=use_chrome,
             )
         )
@@ -1171,6 +1191,7 @@ class BilletterieSniperApp:
         drop_time_str = self.entry_drop_time.get().strip()
         drop_utc = parse_drop_time_str(drop_time_str)
         cookie = self.entry_cookie.get().strip()
+        presale = self.entry_presale.get().strip()
         ntfy = self.entry_ntfy.get().strip()
         use_chrome = self.var_chrome_mode.get()
 
@@ -1192,6 +1213,7 @@ class BilletterieSniperApp:
                 ip_list=sample_20,
                 golden_threshold=golden,
                 drop_time_utc=drop_utc,
+                presale_code=presale if presale else None,
                 ntfy_topic=ntfy if ntfy else None,
                 use_chrome=use_chrome,
             )

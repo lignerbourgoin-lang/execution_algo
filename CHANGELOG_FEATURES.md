@@ -1,5 +1,15 @@
 # Changelog Features
 
+## [2026-10-02] PRESALE_CODE_SUPPORT_AND_GUI_INTEGRATION
+**Fichiers**: `modules/retail/tickets/ticket_engine.py`, `gui/app.py`, `tests/test_tickets.py`
+**Raison**: Prise en charge native des codes d'accès de préventes et codes promotionnels pour déverrouiller les catégories réservées lors des tirs programmés.
+**Logique**:
+- **Support de code prévente dans le moteur (`PRESALE_CODE_CONFIG`)** : Ajout du champ `presale_code` dans `TicketConfig`, injection automatique de l'en-tête `X-Presale-Code` dans les requêtes, et insertion dans le payload JSON (`presale_code` et `promo_code`) des requêtes préconstruites sans surcoût d'allocation au T0.
+- **Intégration dans l'interface graphique GUI (`GUI_PRESALE_INPUT`)** : Ajout d'un champ de saisie dédié "Code / Mot de passe Prévente" dans l'onglet Sniper de `gui/app.py`, persistance automatique dans `gui_settings.json`, et transmission transparente aux moteurs d'armement manuel et d'autopilote multi-IP.
+- **Validation unitaire** : Ajout du test `test_presale_code_in_headers_and_requests` dans `tests/test_tickets.py`. Suite complète portée à 152 tests passants.
+**Attention**:
+- Le code de prévente doit être renseigné avant l'armement ou le lancement de l'autopilote afin d'être injecté dans les requêtes pré-compilées en mémoire.
+
 ## [2026-10-02] AUTOPILOT_MULTI_IP_STAGGERED_AND_TELEMETRY_DASHBOARD
 **Fichiers**: `gui/app.py`, `core/telemetry/tracker.py`, `core/network/persistent_client.py`, `tests/test_core.py`, `tests/test_tickets.py`
 **Raison**: Intégration de bout en bout du tir échelonné multi-IP avec disjoncteur dans l'autopilote GUI (zéro latence de décision humaine), enrichissement du traceur de télémétrie avec distribution des codes HTTP et percentiles p90/p95/p99, et réarmement automatique sur incident réseau.

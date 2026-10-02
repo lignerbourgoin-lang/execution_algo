@@ -44,6 +44,7 @@ class MockTicketingHttpClient:
             method=method,
             url=f"https://billetterie.example.com{endpoint}",
             headers=req_headers,
+            json=json_data,
         )
 
     async def send_fast(self, request, action_id):
@@ -318,6 +319,30 @@ class TestTicketDropEngine(unittest.IsolatedAsyncioTestCase):
         vip_keys = [req.headers.get("idempotency-key") for req in vip_burst]
         self.assertEqual(len(set(vip_keys)), 4)
 
+    async def test_presale_code_in_headers_and_requests(self):
+        import json
+        mock_client = MockTicketingHttpClient()
+        mock_ntp = MockNtpClient()
+        config = TicketConfig(
+            platform_name="billetterie_test",
+            target_url="https://billetterie.example.com",
+            event_id="PRESALE-2026",
+            category_id="CAT_VIP",
+            quantity=2,
+            presale_code="PROMO_SUPER_FAN",
+        )
+        executor = TicketDropExecutor(config=config, http_client=mock_client, ntp_client=mock_ntp)
+        headers = executor._prepare_headers()
+        self.assertEqual(headers.get("X-Presale-Code"), "PROMO_SUPER_FAN")
+
+        await executor.initialize()
+        vip_req = executor._prebuilt_requests.get("CAT_VIP")
+        self.assertIsNotNone(vip_req)
+        self.assertEqual(vip_req.headers.get("x-presale-code"), "PROMO_SUPER_FAN")
+
+        payload = json.loads(vip_req.content.decode("utf-8"))
+        self.assertEqual(payload.get("presale_code"), "PROMO_SUPER_FAN")
+        self.assertEqual(payload.get("promo_code"), "PROMO_SUPER_FAN")
 
 
 class TestDropTimeParser(unittest.TestCase):

@@ -42,6 +42,7 @@ class TicketConfig:
     drop_time_utc: Optional[float] = None  # Epoch timestamp for drop, or None for immediate
     lead_time_ms: float = 35.0             # Advance firing time based on round-trip latency
     auth_token: Optional[str] = None
+    presale_code: Optional[str] = None
     session_cookies: Optional[Dict[str, str]] = None
     auto_open_browser: bool = True
     audible_alert: bool = True
@@ -89,6 +90,8 @@ class TicketDropExecutor(BaseExecutor):
         headers = {}
         if self.config.auth_token:
             headers["Authorization"] = f"Bearer {self.config.auth_token}"
+        if self.config.presale_code:
+            headers["X-Presale-Code"] = self.config.presale_code
         if self.config.session_cookies:
             cookie_header = "; ".join([f"{k}={v}" for k, v in self.config.session_cookies.items()])
             headers["Cookie"] = cookie_header
@@ -110,14 +113,19 @@ class TicketDropExecutor(BaseExecutor):
 
             for attempt in range(burst_count):
                 action_id = f"ticket_{self.config.event_id}_{cat}_b{attempt}_{uuid.uuid4().hex[:8]}"
+                json_payload = {
+                    "event_id": self.config.event_id,
+                    "category_id": cat,
+                    "quantity": self.config.quantity,
+                }
+                if self.config.presale_code:
+                    json_payload["presale_code"] = self.config.presale_code
+                    json_payload["promo_code"] = self.config.presale_code
+
                 req = self.client.build_fast_request(
                     method="POST",
                     endpoint=f"/api/events/{self.config.event_id}/reserve",
-                    json_data={
-                        "event_id": self.config.event_id,
-                        "category_id": cat,
-                        "quantity": self.config.quantity,
-                    },
+                    json_data=json_payload,
                     headers=headers,
                     idempotency_key=action_id,
                 )
@@ -379,6 +387,9 @@ class TicketDropExecutor(BaseExecutor):
                 "category_id": category,
                 "quantity": self.config.quantity,
             }
+            if self.config.presale_code:
+                reservation_body["presale_code"] = self.config.presale_code
+                reservation_body["promo_code"] = self.config.presale_code
             endpoint = payload.get("reserve_endpoint", f"/api/events/{self.config.event_id}/reserve")
             res = await self.client.execute_fast(
                 method="POST",
