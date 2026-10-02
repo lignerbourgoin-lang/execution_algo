@@ -144,6 +144,28 @@ class TestLatencyTracker(unittest.TestCase):
         self.assertFalse(sla_drift["passed"])
         self.assertIn("Clock drift", sla_drift["violations"][0])
 
+    def test_dashboard_report_and_status_distribution(self):
+        tracker = LatencyTracker()
+        t1 = tracker.start_trace("act_1", "https://example.com/api")
+        t1.complete(success=True, status_code=200)
+
+        t2 = tracker.start_trace("act_2", "https://example.com/api")
+        t2.complete(success=False, error="Rate limited", status_code=429)
+
+        summary = tracker.get_summary()
+        self.assertEqual(summary["total_runs"], 2)
+        self.assertEqual(summary["success_runs"], 1)
+        self.assertEqual(summary["status_distribution"].get(200), 1)
+        self.assertEqual(summary["status_distribution"].get(429), 1)
+        self.assertIn("p90_ms", summary)
+        self.assertIn("p99_ms", summary)
+
+        report = tracker.generate_dashboard_report(title="TEST DASHBOARD")
+        self.assertIn("TEST DASHBOARD", report)
+        self.assertIn("Total Executions : 2", report)
+        self.assertIn("HTTP 200: 1", report)
+        self.assertIn("HTTP 429: 1", report)
+
 
 
 

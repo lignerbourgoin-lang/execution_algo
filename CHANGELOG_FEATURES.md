@@ -1,5 +1,16 @@
 # Changelog Features
 
+## [2026-10-02] AUTOPILOT_MULTI_IP_STAGGERED_AND_TELEMETRY_DASHBOARD
+**Fichiers**: `gui/app.py`, `core/telemetry/tracker.py`, `core/network/persistent_client.py`, `tests/test_core.py`, `tests/test_tickets.py`
+**Raison**: Intégration de bout en bout du tir échelonné multi-IP avec disjoncteur dans l'autopilote GUI (zéro latence de décision humaine), enrichissement du traceur de télémétrie avec distribution des codes HTTP et percentiles p90/p95/p99, et réarmement automatique sur incident réseau.
+**Logique**:
+- **Pipeline Autopilote Multi-IP Échelonné (`AUTOPILOT_MULTI_IP_STAGGERED`)** : Dans `TicketWorker.run_autopilot_pipeline`, conservation de l'ensemble des tickets d'or qualifiés (`kept_tickets`) issus du tirage tombola simultané sur 20 IPs. Pré-chauffe parallèle de toutes les sockets HTTP/2 candidates et instanciation du `StaggeredDropOrchestrator` avec `IpCircuitBreakerPool`. Si le palier 0 rencontre une défaillance ou un inventaire saturé, le palier suivant prend immédiatement le relais à +25ms. L'événement de victoire annule instantanément tous les tirs concurrents en vol.
+- **Tableau de bord télémétrique et percentiles (`DASHBOARD_REPORTER`)** : Ajout dans `LatencyTracker` de percentiles fins (p50, p90, p95, p99), d'un comptage granulaire de la distribution des codes d'état HTTP, et de la méthode `generate_dashboard_report()` pour affichage direct opérateur ou console.
+- **Réinitialisation de pré-chauffe sur erreur socket (`PERSISTENT_CLIENT_ERROR_RESET`)** : En cas de `httpx.HTTPError` dans `send_fast()`, passage de `is_warmed_up` à `False` et enregistrement du code HTTP 0 dans la trace pour forcer une réouverture propre sans tenter d'exploiter un canal rompu.
+- **Couverture de tests unitaire intégrale** : Ajout de `test_dashboard_report_and_status_distribution` dans `test_core.py` et de `TestTicketWorkerAutopilot` dans `test_tickets.py`. Suite complète portée à 151 tests passants.
+**Attention**:
+- Le disjoncteur IP isole automatiquement les adresses throttlées (429) ou challengées (WAF) pour concentrer les tirs ultérieurs uniquement sur les sessions saines.
+
 ## [2026-10-01] HARDENING_AND_SUBMILLIS_OPTIMIZATION
 **Fichiers**: `core/network/ip_pool.py`, `core/network/persistent_client.py`, `core/network/waf_detector.py`, `core/telemetry/tracker.py`, `modules/retail/clock/ntp_sync.py`, `modules/retail/tickets/staggered_executor.py`, `modules/retail/tickets/ticket_engine.py`, `run.py`, `tests/test_core.py`, `tests/test_ip_pool.py`, `tests/test_staggered_executor.py`, `tests/test_waf_detector.py`, `benchmarks/bench_t0_drop_20_ips.py`
 **Raison**: Résolution des goulots d'étranglement de socket (fermeture intempestive à 5s), élimination du chevauchement de spin-wait multi-IP, décodage JSON direct sans allocation, calibration fine de l'horloge Windows NT, détection des salles d'attente virtuelles (Queue-it / Turnstile 200/302), et unification du CLI `run.py`.

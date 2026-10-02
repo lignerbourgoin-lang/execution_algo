@@ -29,16 +29,18 @@ class ExecutionTrace:
     completed_at_ns: Optional[int] = None
     success: bool = False
     error: Optional[str] = None
+    status_code: int = 0
 
     def mark_stage(self, stage_name: str):
         """Record the precise nanosecond when a milestone is reached."""
         self.stages.append(StageTimestamp(name=stage_name, timestamp_ns=time.perf_counter_ns()))
 
-    def complete(self, success: bool = True, error: Optional[str] = None):
-        """Mark execution as finished and freeze timer."""
+    def complete(self, success: bool = True, error: Optional[str] = None, status_code: int = 0):
+        """Mark execution as finished, record status code, and freeze timer."""
         self.completed_at_ns = time.perf_counter_ns()
         self.success = success
         self.error = error
+        self.status_code = status_code
 
     @property
     def total_latency_ms(self) -> float:
@@ -72,6 +74,7 @@ class ExecutionTrace:
             "total_latency_ms": round(self.total_latency_ms, 3),
             "success": self.success,
             "error": self.error,
+            "status_code": self.status_code,
             "metadata": self.metadata,
             "stages": [{"name": stage.name, "timestamp_ns": stage.timestamp_ns} for stage in self.stages],
             "latency_breakdown": self.get_breakdown(),
@@ -90,14 +93,27 @@ class LatencyTracker:
         return trace
 
     def get_summary(self) -> Dict[str, Any]:
+        status_counts: Dict[int, int] = {}
+        for t in self.traces:
+            if t.status_code > 0:
+                status_counts[t.status_code] = status_counts.get(t.status_code, 0) + 1
+
         successful_traces = [t for t in self.traces if t.success]
         if not successful_traces:
-            return {"total_runs": len(self.traces), "success_runs": 0, "avg_ms": 0.0}
+            return {
+                "total_runs": len(self.traces),
+                "success_runs": 0,
+                "avg_ms": 0.0,
+                "status_distribution": status_counts,
+            }
 
         latencies = [t.total_latency_ms for t in successful_traces]
         latencies.sort()
-        p50 = latencies[len(latencies) // 2]
-        p95 = latencies[int(0.95 * len(latencies))]
+        count = len(latencies)
+        p50 = latencies[count // 2]
+        p90 = latencies[int(0.90 * count)] if count > 1 else latencies[0]
+        p95 = latencies[int(0.95 * count)] if count > 1 else latencies[0]
+        p99 = latencies[int(0.99 * count)] if count > 1 else latencies[0]
 
         return {
             "total_runs": len(self.traces),
@@ -105,9 +121,35 @@ class LatencyTracker:
             "min_ms": round(min(latencies), 3),
             "max_ms": round(max(latencies), 3),
             "p50_ms": round(p50, 3),
+            "p90_ms": round(p90, 3),
             "p95_ms": round(p95, 3),
+            "p99_ms": round(p99, 3),
             "avg_ms": round(sum(latencies) / len(latencies), 3),
+            "status_distribution": status_counts,
         }
+
+    # [FEATURE: DASHBOARD_REPORTER] Formatted telemetry summary for operator insight
+    # Raison: Provides immediate visibility into p50/p95 percentiles and HTTP status distributions.
+    # Attention: Pure formatting without external UI dependencies.
+    def generate_dashboard_report(self, title: str = "EXECUTION TELEMETRY DASHBOARD") -> str:
+        """Generates a clean text dashboard summarizing execution latencies and health."""
+        summary = self.get_summary()
+        total = summary.get("total_runs", 0)
+        success = summary.get("success_runs", 0)
+        success_pct = (success / total * 100.0) if total > 0 else 0.0
+
+        lines = [
+            f"=== {title} ===",
+            f"Total Executions : {total}",
+            f"Successful Drops : {success} ({success_pct:.1f}%)",
+            f"Latency p50 / p95: {summary.get('p50_ms', 0.0):.2f} ms / {summary.get('p95_ms', 0.0):.2f} ms",
+            f"Latency Min / Max: {summary.get('min_ms', 0.0):.2f} ms / {summary.get('max_ms', 0.0):.2f} ms",
+        ]
+        status_dist = summary.get("status_distribution", {})
+        if status_dist:
+            dist_str = ", ".join(f"HTTP {code}: {cnt}" for code, cnt in sorted(status_dist.items()))
+            lines.append(f"HTTP Statuses    : {dist_str}")
+        return "\n".join(lines)
 
     def export_audit_json(self, destination_path: str) -> str:
         """

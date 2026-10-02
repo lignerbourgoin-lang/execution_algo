@@ -178,8 +178,9 @@ class PrewarmedHttpClient:
         try:
             response = await self.client.send(request)
         except httpx.HTTPError as error:
+            self.is_warmed_up = False
             logger.warning("%s %s failed: %r", request.method, request.url, error)
-            trace.complete(success=False, error=repr(error))
+            trace.complete(success=False, error=repr(error), status_code=0)
             return {
                 "status_code": 0,
                 "error": repr(error),
@@ -205,7 +206,7 @@ class PrewarmedHttpClient:
         else:
             body = response.text
 
-        trace.complete(success=(response.status_code < 400))
+        trace.complete(success=(response.status_code < 400), status_code=response.status_code)
         return {
             "status_code": response.status_code,
             "body": body,

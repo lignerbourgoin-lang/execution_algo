@@ -35,7 +35,12 @@ from core.rate_limiter.limiter import AdaptiveRateLimiter
 from core.system import boost_process_performance, restore_process_performance
 from core.telemetry.tracker import LatencyTracker
 from modules.retail.clock.ntp_sync import HighPrecisionScheduler, NtpClient
+from core.network.circuit_breaker import IpCircuitBreakerPool
 from modules.retail.tickets.ticket_engine import TicketConfig, TicketDropExecutor
+from modules.retail.tickets.staggered_executor import (
+    StaggerConfig,
+    StaggeredDropOrchestrator,
+)
 from modules.retail.tickets.lottery_selector import (
     LotteryQueueSelector,
     LotteryTicket,
@@ -118,9 +123,11 @@ class TicketWorker:
         self.ntp = NtpClient()
         self.telemetry = LatencyTracker()
         self.executor: TicketDropExecutor = None
+        self.circuit_breaker = IpCircuitBreakerPool()
         self.is_armed = False
         self.checkout_url: str = ""
         self.lottery_selector = LotteryQueueSelector(lower_is_better=True)
+        self.kept_tickets: list[LotteryTicket] = []
 
     def start_loop(self):
         self.loop = asyncio.new_event_loop()
@@ -367,6 +374,7 @@ class TicketWorker:
             min_keep=min_keep,
             max_keep=max_keep,
         )
+        self.kept_tickets = kept
 
         all_sorted = self.lottery_selector.get_best_tickets()
         best = self.lottery_selector.best_ticket()
@@ -393,18 +401,21 @@ class TicketWorker:
         """
         Mode Autopilote Continu (Zéro-Latence Humaine) :
         1. Tirage Tombola simultané sur 20 IPs.
-        2. Tri instantané et détection du Ticket d'or (< 1 ms).
-        3. Transfert automatique de la session gagnante.
-        4. Pré-chauffe HTTP/2 immédiate sur socket dédiée ou Chrome.
-        5. Déclenchement automatique du tir T0.
+        2. Tri instantané et sélection adaptative des tickets d'or (< 1 ms).
+        3. Pré-chauffe parallèle des sockets HTTP/2 ou Chrome sur toutes les IPs retenues.
+        4. Déclenchement orchestré en vagues échelonnées (Staggered Drop) avec disjoncteur IP.
+        5. Dès qu'un palier gagne, annulation instantanée des requêtes en vol et capture du panier.
         6. Si drop complet, bascule automatique sur le rattrapage des paniers (Wave Sniping).
         """
+        # [FEATURE: AUTOPILOT_MULTI_IP_STAGGERED] Multi-IP staggered wave firing across all retained golden tickets
+        # Raison: If the primary IP encounters a 403, 429, or sold-out response, tier 1 immediately fires without manual latency.
+        # Attention: First winning ticket sets stop event and cancels all trailing in-flight tasks.
         self.ui_queue.put(("status", ("AUTOPILOTE ACTIF", "#FF9100")))
-        self.ui_queue.put(("log", "[AUTOPILOTE] ⚡ Démarrage du pipeline automatisé de bout en bout (0 clic)..."))
+        self.ui_queue.put(("log", "[AUTOPILOTE] ⚡ Démarrage du pipeline automatisé multi-IP de bout en bout (0 clic)..."))
         if ntfy_topic:
             self.ntfy_topic = ntfy_topic
 
-        # Étape 1 : Tirage tombola
+        # Étape 1 : Tirage tombola simultané sur 20 IPs
         await self.run_lottery_survey(
             ip_list=ip_list,
             golden_threshold=golden_threshold,
@@ -412,33 +423,169 @@ class TicketWorker:
             max_keep=5,
         )
 
-        best = self.lottery_selector.best_ticket()
-        if not best:
-            self.ui_queue.put(("status", ("ÉCHEC TOMBOLA", "#FF1744")))
-            self.ui_queue.put(("log", "[AUTOPILOTE] ❌ Aucun ticket exploitable. Arrêt du pipeline."))
-            return
+        kept = getattr(self, "kept_tickets", [])
+        if not kept:
+            best = self.lottery_selector.best_ticket()
+            if best:
+                kept = [best]
+            else:
+                self.ui_queue.put(("status", ("ÉCHEC TOMBOLA", "#FF1744")))
+                self.ui_queue.put(("log", "[AUTOPILOTE] ❌ Aucun ticket exploitable. Arrêt du pipeline."))
+                return
 
+        best = kept[0]
         self.ui_queue.put(("best_ip_transferred", best))
         self.ui_queue.put(
-            ("log", f"[AUTOPILOTE] ⚡ Transfert instantané de la session {best.ip_address} (#{best.queue_number}). Pré-chauffe...")
+            ("log", f"[AUTOPILOTE] ⚡ {len(kept)} ticket(s) qualifié(s). Meilleure session: {best.ip_address} (#{best.queue_number}). Pré-chauffe...")
         )
 
-        # Étape 2 : Armement de la socket HTTP/2 ou Chrome
-        session_cookie = f"session_{best.ip_address.replace('.', '_')}"
-        await self.arm_engine(
-            target_url=target_url,
-            event_id=event_id,
-            category_id=category_id,
-            quantity=quantity,
-            lead_time_ms=lead_time_ms,
-            session_cookie=session_cookie,
+        # Synchronisation horloge atomique NTP
+        sync_res = await self.ntp.sync_async()
+        offset_ms = sync_res.get("median_offset_ms", 0.0)
+        self.ui_queue.put(("ntp_offset", f"{offset_ms:+.1f} ms"))
+        self.ui_queue.put(("log", f"[NTP] Horloge atomique synchronisée : décalage {offset_ms:+.2f} ms"))
+
+        # Worker Chrome optionnel (anti-WAF parité TLS) sur session primaire
+        if use_chrome:
+            try:
+                from modules.retail.tickets.queue_worker import HeadlessQueueWorker, QueueWorkerConfig
+                worker_cfg = QueueWorkerConfig(
+                    worker_id="gui_chrome_worker",
+                    target_queue_url=target_url,
+                    headless=True,
+                    enable_keepalive=True,
+                )
+                self.browser_worker = HeadlessQueueWorker(worker_cfg)
+                await self.browser_worker.start()
+                self.ui_queue.put(("log", "[CHROME] 🛡️ Instance Chrome initialisée avec parité TLS 100%."))
+            except Exception as chrome_err:
+                self.ui_queue.put(("log", f"[CHROME] Repli sur socket direct ({chrome_err})"))
+                self.browser_worker = None
+        else:
+            self.browser_worker = None
+
+        # Catégories de places
+        categories = [c.strip() for c in category_id.split(",") if c.strip()]
+        primary_cat = categories[0] if categories else "DEFAULT"
+        fallback_cats = categories[1:] if len(categories) > 1 else []
+
+        # Étape 2 : Pré-chauffe HTTP/2 en parallèle sur toutes les IPs retenues
+        executors: list[TicketDropExecutor] = []
+        for idx, ticket in enumerate(kept):
+            client = PrewarmedHttpClient(
+                base_url=target_url,
+                rate_limiter=AdaptiveRateLimiter(base_rate=5.0, burst_capacity=10.0),
+                telemetry=self.telemetry,
+            )
+            client.bound_ip = ticket.ip_address
+
+            cfg = TicketConfig(
+                platform_name="billetterie",
+                target_url=target_url,
+                event_id=event_id,
+                category_id=primary_cat,
+                fallback_categories=fallback_cats,
+                quantity=quantity,
+                drop_time_utc=drop_time_utc,
+                lead_time_ms=lead_time_ms,
+                session_cookies={"session_id": f"session_{ticket.ip_address.replace('.', '_')}"},
+                auto_open_browser=True,
+                burst_retries=5,
+                burst_interval_ms=80.0,
+            )
+
+            executor = TicketDropExecutor(
+                config=cfg,
+                http_client=client,
+                ntp_client=self.ntp,
+                telemetry=self.telemetry,
+                browser_worker=self.browser_worker if (idx == 0 and use_chrome) else None,
+            )
+            executors.append(executor)
+
+        await asyncio.gather(*(e.initialize() for e in executors))
+        self.executor = executors[0]
+        self.http_client = executors[0].client
+        self.is_armed = True
+        self.ui_queue.put(("status", ("ARMÉ & PRÊT", "#00E676")))
+        self.ui_queue.put(
+            ("log", f"[AUTOPILOTE] ⚡ {len(executors)} sessions dorées pré-chauffées en parallèle avec disjoncteur IP.")
+        )
+
+        # Étape 3 : Tir échelonné multi-IP avec disjoncteur (Staggered Drop)
+        stagger_config = StaggerConfig(
+            stagger_interval_ms=25.0,
+            sessions_per_tier=1,
             drop_time_utc=drop_time_utc,
-            use_chrome=use_chrome,
+        )
+        orchestrator = StaggeredDropOrchestrator(
+            executors=executors,
+            config=stagger_config,
+            circuit_breaker=self.circuit_breaker,
         )
 
-        # Étape 3 : Déclenchement du tir
-        self.ui_queue.put(("log", "[AUTOPILOTE] ⚡ Déclenchement du tir de réservation immédiat..."))
-        await self.trigger_drop()
+        self.ui_queue.put(("status", ("TIR ÉCHELONNÉ EN COURS", "#FFD600")))
+        self.ui_queue.put(
+            ("log", f">> [AUTOPILOTE] Déclenchement du tir échelonné sur {len(executors)} paliers (offset 25ms)...")
+        )
+
+        result = await orchestrator.execute_staggered_drop()
+
+        if result.success and result.winning_executor:
+            winning_exec = result.winning_executor
+            self.executor = winning_exec
+            cart = winning_exec.active_cart
+            self.checkout_url = cart.checkout_url if cart else ""
+            win_ip = getattr(winning_exec.client, "bound_ip", "Inconnue")
+
+            self.ui_queue.put(("status", ("PANIER OBTENU !", "#00E676")))
+            self.ui_queue.put(("cart_url", self.checkout_url))
+            self.ui_queue.put(
+                ("log", f"[✔] PLACES RÉSERVÉES par IP {win_ip} (Palier {result.winning_tier}) ! Latence: {result.duration_ms:.2f} ms")
+            )
+            if result.cancelled_count > 0:
+                self.ui_queue.put(
+                    ("log", f"[!] {result.cancelled_count} requête(s) suivante(s) annulée(s) instantanément.")
+                )
+            if cart:
+                expires_in = cart.expires_at_epoch - time.time()
+                if expires_in > 0:
+                    self.ui_queue.put(("log", f"[!] Vous avez {expires_in / 60:.0f} min pour finaliser le paiement."))
+            self.ui_queue.put(("latency", f"{result.duration_ms:.1f} ms"))
+
+            # Notification push mobile si configuré
+            if getattr(self, "ntfy_topic", None):
+                try:
+                    from modules.retail.notify.notifiers import Notification, NtfyNotifier
+                    notifier = NtfyNotifier(topic=self.ntfy_topic)
+                    await notifier.send(
+                        Notification(
+                            title=f"🎟️ Billets Réservés ! [{primary_cat}]",
+                            message=f"{quantity} place(s) réservée(s) par {win_ip}. Cliquez vite pour payer !",
+                            url=self.checkout_url,
+                            is_urgent=True,
+                        )
+                    )
+                    await notifier.close()
+                    self.ui_queue.put(("log", "[NTFY] Alerte envoyée sur votre smartphone via ntfy.sh"))
+                except Exception as e:
+                    self.ui_queue.put(("log", f"[NTFY] Note alerte: {e}"))
+
+            # Sonnerie Windows et ouverture automatique du navigateur pour 3D-Secure
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                pass
+
+            if self.checkout_url:
+                try:
+                    webbrowser.open(self.checkout_url)
+                except Exception:
+                    pass
+        else:
+            self.ui_queue.put(("status", ("ÉCHEC DU DROP", "#FF1744")))
+            self.ui_queue.put(("log", f"[✖] Échec des tirs échelonnés : {result.error}"))
 
         # Étape 4 : Fallback automatique en Wave Sniping si non capturé
         if not self.checkout_url:

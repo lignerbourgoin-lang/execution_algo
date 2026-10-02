@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import unittest
+from unittest.mock import AsyncMock, patch
 import httpx
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -331,6 +332,72 @@ class TestDropTimeParser(unittest.TestCase):
         self.assertIsNone(parse_drop_time_str(""))
         self.assertIsNone(parse_drop_time_str("   "))
         self.assertIsNone(parse_drop_time_str(None))
+
+
+class TestTicketWorkerAutopilot(unittest.IsolatedAsyncioTestCase):
+    async def test_survey_keeps_tickets(self):
+        import queue
+        from gui.app import TicketWorker
+        ui_q = queue.Queue()
+        worker = TicketWorker(ui_q)
+        await worker.run_lottery_survey(
+            ip_list=["192.168.1.1", "192.168.1.2"],
+            golden_threshold=50000,
+            min_keep=2,
+            max_keep=2,
+        )
+        self.assertEqual(len(worker.kept_tickets), 2)
+
+    @patch("gui.app.StaggeredDropOrchestrator.execute_staggered_drop")
+    @patch("gui.app.PrewarmedHttpClient.start", new_callable=AsyncMock)
+    @patch("modules.retail.clock.ntp_sync.NtpClient.sync_async", new_callable=AsyncMock)
+    async def test_run_autopilot_pipeline_success(self, mock_ntp, mock_start, mock_exec):
+        import queue
+        from gui.app import TicketWorker
+        from modules.retail.tickets.staggered_executor import StaggeredDropResult
+        from modules.retail.tickets.ticket_engine import CartReservation, TicketConfig, TicketDropExecutor
+
+        mock_ntp.return_value = {"median_offset_ms": 1.2}
+        mock_start.return_value = None
+
+        dummy_cfg = TicketConfig(
+            platform_name="billetterie",
+            target_url="https://example.com",
+            event_id="E1",
+            category_id="C1",
+        )
+        dummy_exec = TicketDropExecutor(dummy_cfg, http_client=AsyncMock())
+        dummy_exec.active_cart = CartReservation(
+            token="cart_tok_123",
+            event_id="E1",
+            category_id="C1",
+            quantity=2,
+            expires_at_epoch=time.time() + 600,
+            checkout_url="https://example.com/checkout?cart=123",
+            reserved_at_ms=10.0,
+        )
+
+        mock_exec.return_value = StaggeredDropResult(
+            success=True,
+            winning_executor=dummy_exec,
+            winning_tier=0,
+            duration_ms=12.5,
+            cancelled_count=1,
+        )
+
+        ui_q = queue.Queue()
+        worker = TicketWorker(ui_q)
+        await worker.run_autopilot_pipeline(
+            target_url="https://example.com",
+            event_id="E1",
+            category_id="C1",
+            quantity=2,
+            lead_time_ms=35.0,
+            ip_list=["192.168.1.1", "192.168.1.2"],
+            golden_threshold=50000,
+        )
+
+        self.assertEqual(worker.checkout_url, "https://example.com/checkout?cart=123")
 
 
 if __name__ == "__main__":
